@@ -3,6 +3,7 @@
 |-- main.py
 |-- README.md
 |-- requirements.txt
+|-- yolov8n.pt
 |-- yolov8x.pt
 |-- __pycache__
     |-- main.cpython-310.pyc

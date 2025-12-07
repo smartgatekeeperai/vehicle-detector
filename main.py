@@ -16,7 +16,9 @@ import torch
 # Config
 # -------------------------------
 
-YOLO_MODEL_PATH = "yolov8x.pt"
+# You can use yolov8n.pt (tiny, faster) or yolov8x.pt (bigger, more accurate)
+# For Render free tier, yolov8n.pt is recommended. Locally you can keep yolov8x.pt.
+YOLO_MODEL_PATH = "yolov8n.pt"
 
 # COCO vehicle class IDs (YOLOv8 + COCO)
 # 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
@@ -26,8 +28,11 @@ VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 VEHICLE_CLASS_NAMES = {
     2: "car",
     3: "motorcycle",
+    4: "airplane",
     5: "bus",
+    6: "train",
     7: "truck",
+    # extra custom slots
     21: "pickup",
     22: "utility vehicle",
     23: "van",
@@ -36,7 +41,8 @@ VEHICLE_CLASS_NAMES = {
 }
 
 # Detection thresholds – tune for your use case
-CONF_THRESHOLD = 0.5   # higher -> fewer, more confident detections
+# Lowered from 0.5 -> 0.25 to be more forgiving, especially with yolov8n
+CONF_THRESHOLD = 0.25
 IOU_THRESHOLD = 0.5
 
 # How long (in seconds) we keep using the last detection
@@ -180,6 +186,25 @@ def build_bbox(
     )
 
 
+def make_detection_from_box(box, image_w: int, image_h: int) -> VehicleDetection:
+    """Helper to convert a YOLO box to our VehicleDetection model."""
+    cls_id = int(box.cls.item())
+    conf = float(box.conf.item())
+
+    # xyxy format
+    x1, y1, x2, y2 = box.xyxy[0].tolist()
+    bbox = build_bbox(x1, y1, x2, y2, image_w, image_h)
+
+    class_name = VEHICLE_CLASS_NAMES.get(cls_id, f"class_{cls_id}")
+
+    return VehicleDetection(
+        bbox=bbox,
+        confidence=conf,
+        class_id=cls_id,
+        class_name=class_name,
+    )
+
+
 # -------------------------------
 # Routes
 # -------------------------------
@@ -232,11 +257,8 @@ async def detect_vehicles(file: UploadFile = File(...)):
     t1 = time.time()
     inference_ms = (t1 - t0) * 1000.0
 
-    detections: List[VehicleDetection] = []
-
     # Safety: if model returned nothing at all
     if not results:
-        # Try smoothing: reuse last detection if still "fresh"
         now = time.time()
         if LAST_DETECTION and (now - LAST_DETECTION_TS) <= HOLD_SECONDS:
             return LAST_DETECTION
@@ -270,27 +292,27 @@ async def detect_vehicles(file: UploadFile = File(...)):
             model=YOLO_MODEL_PATH,
         )
 
+    # ---------------------------
+    # Build detections
+    # ---------------------------
+    vehicle_detections: List[VehicleDetection] = []
+    all_detections: List[VehicleDetection] = []
+
     for box in boxes:
-        cls_id = int(box.cls.item())
-        conf = float(box.conf.item())
-        if cls_id not in VEHICLE_CLASS_IDS:
-            continue
+        det = make_detection_from_box(box, width, height)
+        all_detections.append(det)
 
-        # xyxy format
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        bbox = build_bbox(x1, y1, x2, y2, width, height)
+        if det.class_id in VEHICLE_CLASS_IDS:
+            vehicle_detections.append(det)
 
-        detections.append(
-            VehicleDetection(
-                bbox=bbox,
-                confidence=conf,
-                class_id=cls_id,
-                class_name=VEHICLE_CLASS_NAMES.get(cls_id, f"class_{cls_id}"),
-            )
-        )
-
-    # If no vehicles after filtering class IDs -> smoothing again
-    if not detections:
+    # Prefer real vehicles if present; otherwise fall back to any class YOLO found
+    if vehicle_detections:
+        detections = vehicle_detections
+    elif all_detections:
+        # Fallback: return all detections even if YOLO didn't label them as vehicles.
+        # This helps debugging and still gives you boxes to work with.
+        detections = all_detections
+    else:
         now = time.time()
         if LAST_DETECTION and (now - LAST_DETECTION_TS) <= HOLD_SECONDS:
             return LAST_DETECTION

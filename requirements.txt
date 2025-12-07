@@ -8,7 +8,3 @@ ultralytics==8.3.27
 
 # Optional but common
 numpy==2.1.2
-
-# Torch (CPU version) – recommended for server without GPU
-torch==2.4.1
-torchvision==0.19.1
