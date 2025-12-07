@@ -3,6 +3,7 @@
 |-- main.py
 |-- README.md
 |-- requirements.txt
+|-- start.py
 |-- yolov8n.pt
 |-- yolov8x.pt
 |-- __pycache__
