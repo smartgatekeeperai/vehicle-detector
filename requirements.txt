@@ -1,0 +1,14 @@
+fastapi==0.115.4
+uvicorn[standard]==0.32.0
+pillow==11.0.0
+python-multipart==0.0.9
+
+# YOLOv8 / Ultralytics
+ultralytics==8.3.27
+
+# Optional but common
+numpy==2.1.2
+
+# Torch (CPU version) – recommended for server without GPU
+torch==2.4.1
+torchvision==0.19.1
