@@ -1,6 +1,32 @@
+# --- Web API stack ---
 fastapi==0.115.4
 uvicorn[standard]==0.32.0
-pillow==11.0.0
 python-multipart==0.0.9
+pydantic==2.9.2
+pydantic-core==2.23.4
+
+# --- Image / numeric stack ---
+pillow==11.0.0
+numpy==1.26.4
+
+# --- YOLOv8 / Ultralytics ---
 ultralytics==8.3.27
-numpy==2.1.2
+
+# --- PyTorch CPU (Windows, Python 3.10) ---
+torch==2.4.1
+torchvision==0.19.1
+
+# --- FastALPR (plate detection + OCR) ---
+fast-alpr==0.3.0
+
+# --- ONNX runtime for FastALPR ---
+onnxruntime==1.18.0
+
+# --- Database (PostgreSQL) ---
+asyncpg==0.29.0
+
+# --- Real-time (Pusher) ---
+pusher==3.3.2
+
+# --- Env loader ---
+python-dotenv==1.0.1
