@@ -19,9 +19,9 @@ if os.path.exists(parent_env_path):
 
 import numpy as np
 import asyncpg
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from PIL import Image
 
@@ -133,6 +133,14 @@ PASS_LOCK_MS = 10_000  # 10 seconds
 
 # How long after NO vehicle is seen we still keep last gate_state before reset
 CLEAR_AFTER_MS = 5_000  # 5 seconds
+
+# =========================================================
+# LATEST FRAMES (Node-style `latestFrames = new Map()`)
+# =========================================================
+
+# Python equivalent of: const latestFrames = new Map();
+# Key: stream_id (str) → Value: { "buffer": bytes, "mimetype": str, "ts": int }
+latest_frames: Dict[str, Dict[str, Any]] = {}
 
 # --- DB (PostgreSQL) ---
 # Try direct DATABASE_URL first
@@ -694,6 +702,98 @@ async def health():
 async def alpr_models():
     return {"detector_models": DETECTOR_MODELS, "ocr_models": OCR_MODELS}
 
+
+# ---------------------------------------------------------
+# /stream-frame (mobile → server frame upload)
+# Node streamFrameHandler equivalent
+# ---------------------------------------------------------
+
+@app.post("/stream-frame")
+async def stream_frame(
+    frame: UploadFile = File(...),
+    stream_id: Optional[str] = None,
+):
+    """
+    Receives a single image frame from mobile, stores it in memory per stream_id,
+    and notifies listeners via Pusher with metadata only.
+
+    Node JS equivalent:
+
+      const { buffer, mimetype } = req.file;
+      const streamId = req.body.stream_id || "mobile-1";
+      const ct = mimetype || "image/jpeg";
+      const ts = Date.now();
+      latestFrames.set(streamId, { buffer, mimetype: ct, ts });
+      await pusher.trigger("video-channel", "frame", { stream_id: streamId, ts });
+    """
+    if not frame:
+        raise HTTPException(status_code=400, detail="frame is required")
+
+    data = await frame.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty frame")
+
+    sid = stream_id or "mobile-1"
+    ct = frame.content_type or "image/jpeg"
+    ts = int(time.time() * 1000)
+
+    # 1) Store latest frame in memory
+    latest_frames[sid] = {
+        "buffer": data,
+        "mimetype": ct,
+        "ts": ts,
+    }
+
+    # 2) Notify via Pusher (metadata only)
+    try:
+        pusher_client.trigger("video-channel", "frame", {
+            "stream_id": sid,
+            "ts": ts,
+        })
+    except Exception as e:
+        print("[/stream-frame] Pusher error:", e)
+
+    return JSONResponse({"success": True})
+
+
+# ---------------------------------------------------------
+# /latest-frame (web → server)
+# Node getLatestFrameHandler equivalent
+# ---------------------------------------------------------
+
+@app.get("/latest-frame")
+async def get_latest_frame(stream_id: str = Query("mobile-1")):
+    """
+    Returns the raw bytes of the latest frame for given stream_id.
+
+    Node JS equivalent:
+
+      const streamId = (req.query.stream_id || "mobile-1").toString();
+      const frame = latestFrames.get(streamId);
+      if (!frame) 404 "No frame yet";
+      res.setHeader("Content-Type", frame.mimetype || "image/jpeg");
+      res.setHeader("Cache-Control", "no-store");
+      res.send(frame.buffer);
+    """
+    frame = latest_frames.get(stream_id)
+    if not frame:
+        raise HTTPException(status_code=404, detail="No frame yet")
+
+    mimetype = frame.get("mimetype") or "image/jpeg"
+    buffer = frame.get("buffer") or b""
+
+    headers = {
+        "Cache-Control": "no-store",
+        # Add if dashboard is on a different origin:
+        # "Access-Control-Allow-Origin": "*",
+    }
+
+    return Response(content=buffer, media_type=mimetype, headers=headers)
+
+
+# ---------------------------------------------------------
+# /detect (unchanged; ALPR + YOLO)
+# ---------------------------------------------------------
 
 @app.post("/detect")
 async def detect_all(
