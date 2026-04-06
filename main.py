@@ -1,25 +1,24 @@
+# main.py
 import io
 import os
 import time
 import json
 from functools import lru_cache
-from typing import List, Optional, Literal, get_args, Any, Dict
+from typing import List, Optional, Literal, get_args, Any, Dict, Tuple
 
 from dotenv import load_dotenv  # Load env vars from .env
 
 # ---------------------------------------------------------
 # Load .env (current dir + parent, to catch root .env)
 # ---------------------------------------------------------
-# First load from current directory (vehicle-detector/.env)
 load_dotenv()
-# Also try parent directory (smartgatekeeperai/.env)
 parent_env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
 if os.path.exists(parent_env_path):
     load_dotenv(parent_env_path, override=False)
 
 import numpy as np
 import asyncpg
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -34,8 +33,9 @@ from fast_alpr import ALPR
 from fast_alpr.default_detector import PlateDetectorModel
 from fast_alpr.default_ocr import OcrModel
 
+
 # =========================================================
-# YOLO CONFIG (VEHICLES)
+# CONFIG
 # =========================================================
 
 YOLO_MODEL_PATH = "yolov8x.pt"
@@ -59,6 +59,18 @@ VEHICLE_CLASS_NAMES = {
 CONF_THRESHOLD = 0.5
 IOU_THRESHOLD = 0.5
 HOLD_SECONDS = 0.7  # smoothing window for vehicles (YOLO)
+
+# Gate smoothing / lock behavior
+PASS_LOCK_MS = 10_000   # keep registered state for up to 10s while vehicle present
+CLEAR_AFTER_MS = 5_000  # keep last state for up to 5s after vehicle disappears
+
+# Logging window rule (5 minutes)
+LOG_WINDOW_MS = 5 * 60 * 1000
+
+# Used for ImagePreview in Logs
+# Example: https://your-space.hf.space  or https://your-domain.com
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+
 
 # =========================================================
 # FASTALPR CONFIG (PLATES)
@@ -102,6 +114,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # =========================================================
 # DEVICE + YOLO MODEL
 # =========================================================
@@ -111,42 +124,37 @@ print(f"[INIT] Loading YOLOv8 model on device: {DEVICE}")
 yolo_model = YOLO(YOLO_MODEL_PATH)
 yolo_model.to(DEVICE)
 
+
 # =========================================================
-# GATE STATE + DB + PUSHER (Node.js logic port)
+# GATE STATE (GLOBAL)
 # =========================================================
 
-# Global gate state equivalent to Node's gateState
 gate_state: Dict[str, Any] = {
-    "vehicleFound": False,  # boolean (true/false)
+    "vehicleFound": False,
     "plate": None,
-    "driver": None,         # DB JSONB "Driver"
-    "vehicle": None,        # { brand, model, type }
-    "lastUpdate": None,     # ms epoch
+    "driver": None,
+    "vehicle": None,
+    "lastUpdate": None,  # ms epoch
 }
 
-# When a registered plate is detected, we "lock" that vehicle for a while.
 current_registered_gate_state: Optional[Dict[str, Any]] = None
 current_registered_ts: int = 0  # ms epoch when registered plate was confirmed
 
-# How long we keep the registered vehicle active WHILE a vehicle is present
-PASS_LOCK_MS = 10_000  # 10 seconds
-
-# How long after NO vehicle is seen we still keep last gate_state before reset
-CLEAR_AFTER_MS = 5_000  # 5 seconds
 
 # =========================================================
-# LATEST FRAMES (Node-style `latestFrames = new Map()`)
+# LATEST FRAMES (Node-style latestFrames = new Map())
 # =========================================================
 
-# Python equivalent of: const latestFrames = new Map();
-# Key: stream_id (str) → Value: { "buffer": bytes, "mimetype": str, "ts": int }
+# Key: stream_id -> { "buffer": bytes, "mimetype": str, "ts": int }
 latest_frames: Dict[str, Dict[str, Any]] = {}
 
-# --- DB (PostgreSQL) ---
-# Try direct DATABASE_URL first
+
+# =========================================================
+# DB (PostgreSQL)
+# =========================================================
+
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# If not set, build it from DB_* vars like your Node app
 if not DATABASE_URL:
     DB_USER = os.getenv("DB_USER", "")
     DB_PASSWORD = os.getenv("DB_PASSWORD", "")
@@ -155,7 +163,6 @@ if not DATABASE_URL:
     DB_NAME = os.getenv("DB_NAME", "")
 
     if DB_USER and DB_NAME:
-        # asyncpg uses standard postgresql:// URI
         DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
         print("[DB] Constructed DATABASE_URL from DB_* env vars:", DATABASE_URL)
     else:
@@ -177,20 +184,27 @@ async def startup():
 
 
 async def db_query(sql: str, params: List[Any] = None) -> List[Dict[str, Any]]:
-    """Equivalent to Node dbQuery using asyncpg."""
     params = params or []
     pool = getattr(app.state, "db_pool", None)
     if pool is None:
-        raise RuntimeError(
-            "DB pool is not initialized. Set DATABASE_URL and ensure startup event runs."
-        )
-
+        raise RuntimeError("DB pool is not initialized. Set DATABASE_URL and ensure startup event runs.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
         return [dict(r) for r in rows]
 
 
-# --- Pusher client (Node-style env logic: cloud + optional local) ---
+async def db_execute(sql: str, params: List[Any] = None) -> None:
+    params = params or []
+    pool = getattr(app.state, "db_pool", None)
+    if pool is None:
+        raise RuntimeError("DB pool is not initialized. Set DATABASE_URL and ensure startup event runs.")
+    async with pool.acquire() as conn:
+        await conn.execute(sql, *params)
+
+
+# =========================================================
+# PUSHER CLIENT
+# =========================================================
 
 PUSHER_APP_ID = os.getenv("PUSHER_APP_ID")
 PUSHER_KEY = os.getenv("PUSHER_KEY", "")
@@ -200,11 +214,8 @@ PUSHER_HOST = os.getenv("PUSHER_HOST")
 PUSHER_PORT = os.getenv("PUSHER_PORT")
 USE_LOCAL_PUSHER = os.getenv("USE_LOCAL_PUSHER", "false").lower() == "true"
 
-# Same logic as Node:
-# const isLocalEnv = process.env.VERCEL !== '1' && process.env.NODE_ENV !== 'production';
 is_local_env = os.getenv("VERCEL") != "1" and os.getenv("NODE_ENV") != "production"
 
-# Debug-print Pusher env values
 print(
     "[Pusher] env values:",
     "APP_ID=", repr(PUSHER_APP_ID),
@@ -218,7 +229,6 @@ print(
 )
 
 if not PUSHER_APP_ID or PUSHER_APP_ID.strip() == "":
-    # No valid APP_ID → create dummy client so the app can still start
     print("[WARN] PUSHER_APP_ID is not set or invalid. Using DummyPusher (no real-time events).")
 
     class DummyPusher:
@@ -227,32 +237,21 @@ if not PUSHER_APP_ID or PUSHER_APP_ID.strip() == "":
 
     pusher_client: Any = DummyPusher()
 else:
-    # Default: Pusher CLOUD (like Node)
     client_kwargs: Dict[str, Any] = {
         "app_id": PUSHER_APP_ID,
         "key": PUSHER_KEY,
         "secret": PUSHER_SECRET,
         "cluster": PUSHER_CLUSTER,
-        "ssl": True,  # useTLS: true
+        "ssl": True,
     }
 
-    # Optional local mode for Soketi/other compatible server
-    # if (isLocalEnv && USE_LOCAL_PUSHER && PUSHER_HOST)
     if is_local_env and USE_LOCAL_PUSHER and PUSHER_HOST:
         host = PUSHER_HOST
         port = int(PUSHER_PORT or "6001")
         print(f"[Pusher] Using LOCAL server at {host}:{port}")
-        # For local: HTTP (no TLS), host/port; cluster is not used
         client_kwargs.pop("cluster", None)
-        client_kwargs.update(
-            {
-                "host": host,
-                "port": port,
-                "ssl": False,
-            }
-        )
+        client_kwargs.update({"host": host, "port": port, "ssl": False})
     else:
-        # Cloud mode (works on localhost + prod)
         print(f"[Pusher] Using CLOUD (cluster={PUSHER_CLUSTER}, TLS=True)")
 
     pusher_client = Pusher(**client_kwargs)
@@ -260,7 +259,7 @@ else:
 
 
 # =========================================================
-# MODELS (Pydantic)
+# Pydantic Models
 # =========================================================
 
 class VehicleBBox(BaseModel):
@@ -290,7 +289,7 @@ LAST_VEHICLE_TS: float = 0.0
 
 
 # =========================================================
-# HELPERS
+# HELPERS (Image / YOLO / ALPR)
 # =========================================================
 
 def load_image_to_numpy(data: bytes) -> np.ndarray:
@@ -301,14 +300,7 @@ def load_image_to_numpy(data: bytes) -> np.ndarray:
     return np.array(img)
 
 
-def build_vehicle_bbox(
-    x1: float,
-    y1: float,
-    x2: float,
-    y2: float,
-    image_w: int,
-    image_h: int,
-) -> VehicleBBox:
+def build_vehicle_bbox(x1: float, y1: float, x2: float, y2: float, image_w: int, image_h: int) -> VehicleBBox:
     width = x2 - x1
     height = y2 - y1
     cx = x1 + width / 2.0
@@ -320,18 +312,11 @@ def build_vehicle_bbox(
     nheight = height / image_h
 
     return VehicleBBox(
-        x1=x1,
-        y1=y1,
-        x2=x2,
-        y2=y2,
-        width=width,
-        height=height,
-        cx=cx,
-        cy=cy,
-        nx=nx,
-        ny=ny,
-        nwidth=nwidth,
-        nheight=nheight,
+        x1=x1, y1=y1, x2=x2, y2=y2,
+        width=width, height=height,
+        cx=cx, cy=cy,
+        nx=nx, ny=ny,
+        nwidth=nwidth, nheight=nheight,
     )
 
 
@@ -387,7 +372,6 @@ def run_yolo_vehicles(img_np: np.ndarray) -> List[VehicleDetection]:
             )
         )
 
-    # sort by confidence (highest first)
     detections.sort(key=lambda d: d.confidence, reverse=True)
 
     LAST_VEHICLE_DETECTIONS = detections
@@ -405,10 +389,7 @@ def serialize_alpr_result(result) -> dict:
             conf_val = float(sum(raw_conf) / len(raw_conf)) if raw_conf else 0.0
         else:
             conf_val = float(raw_conf or 0.0)
-        ocr = {
-            "text": getattr(ocr_obj, "text", None),
-            "confidence": conf_val,
-        }
+        ocr = {"text": getattr(ocr_obj, "text", None), "confidence": conf_val}
 
     bbox = None
     detection = getattr(result, "detection", None)
@@ -437,23 +418,10 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str) -> dict:
         raise HTTPException(status_code=500, detail=f"ALPR error: {e}")
 
     plates = [serialize_alpr_result(r) for r in results] if results else []
-
-    return {
-        "model": {
-            "detector_model": detector_name,
-            "ocr_model": ocr_name,
-        },
-        "plates": plates,
-    }
+    return {"model": {"detector_model": detector_name, "ocr_model": ocr_name}, "plates": plates}
 
 
 def normalize_plate_text(plates: List[dict]) -> List[str]:
-    """
-    Convert FastALPR plate results into normalized strings:
-    - take plate['ocr']['text']
-    - remove spaces and dashes
-    - lowercase
-    """
     cleaned: List[str] = []
     for p in plates:
         ocr = p.get("ocr") or {}
@@ -472,104 +440,159 @@ def normalize_plate_text(plates: List[dict]) -> List[str]:
     return cleaned
 
 
+def pick_best_plate_text_and_conf(plates: List[dict]) -> Tuple[Optional[str], float]:
+    best_text = None
+    best_conf = 0.0
+    for p in plates or []:
+        ocr = (p.get("ocr") or {})
+        text = ocr.get("text")
+        conf = ocr.get("confidence")
+        if not text:
+            continue
+        try:
+            conf_val = float(conf) if conf is not None else 0.0
+        except Exception:
+            conf_val = 0.0
+        if conf_val > best_conf:
+            best_conf = conf_val
+            best_text = text
+    return best_text, best_conf
+
+
+def to_ai_confidence_bigint(best_conf_0_1: float) -> int:
+    # store 0..100 (bigint)
+    if best_conf_0_1 < 0:
+        best_conf_0_1 = 0.0
+    if best_conf_0_1 > 1:
+        best_conf_0_1 = 1.0
+    return int(round(best_conf_0_1 * 100))
+
+
+def build_image_preview_url(stream_id: str) -> str:
+    suffix = f"/latest-frame?stream_id={stream_id}"
+    return (PUBLIC_BASE_URL + suffix) if PUBLIC_BASE_URL else suffix
+
+
 # =========================================================
-# GATE STATE LOGIC (with plate lock + smooth clearing)
+# LOGGING HELPERS (dbo."Logs")
+# NOTE: For 5-minute checks, your table must have "CreatedAt".
+# =========================================================
+
+async def get_last_log_time_ms_for_plate(plate_text: str) -> Optional[int]:
+    try:
+        sql = """
+            SELECT EXTRACT(EPOCH FROM "CreatedAt") * 1000 AS ts_ms
+            FROM dbo."Logs"
+            WHERE "PlateNumber" = $1
+            ORDER BY "CreatedAt" DESC
+            LIMIT 1
+        """
+        rows = await db_query(sql, [plate_text])
+        if not rows:
+            return None
+        ts_ms = rows[0].get("ts_ms")
+        return int(ts_ms) if ts_ms is not None else None
+    except Exception as e:
+        print('[Logs] Warning: get_last_log_time_ms_for_plate failed (missing "CreatedAt"?):', e)
+        return None
+
+
+async def insert_log_row(
+    plate_number: str,
+    driver_json: Optional[dict],
+    vehicle_json: Optional[dict],
+    role_type: str,
+    verification: str,
+    camera_source: str,
+    image_preview: str,
+    ai_confidence: int,
+) -> None:
+    sql = """
+        INSERT INTO dbo."Logs"
+            ("PlateNumber", "Driver", "Vehicle", "RoleType", "Verification", "CameraSource", "ImagePreview", "AIConfidence")
+        VALUES
+            ($1, $2::jsonb, $3::jsonb, $4, $5, $6, $7, $8)
+    """
+    await db_execute(sql, [
+        plate_number,
+        json.dumps(driver_json) if driver_json is not None else None,
+        json.dumps(vehicle_json) if vehicle_json is not None else None,
+        role_type,
+        verification,
+        camera_source,
+        image_preview,
+        int(ai_confidence),
+    ])
+
+
+# =========================================================
+# GATE STATE LOGIC (lock + smooth clear + logging)
 # =========================================================
 
 async def update_gate_state_and_push(
     vehicles: List[VehicleDetection],
     plates: List[dict],
+    camera_source: str,
 ) -> Dict[str, Any]:
     """
-    Logic with:
-    1) Plate lock: if a registered plate is found, keep returning that same
-       driver/vehicle for up to PASS_LOCK_MS while a vehicle is present.
-    2) Smooth clear: after no vehicle is detected, keep last state for up to
-       CLEAR_AFTER_MS, then reset for the next vehicle.
+    Logging (5-min rule applies to BOTH registered and not-registered):
+      - if last log for that plate was within 5 min -> SKIP INSERT
+      - else INSERT:
+         * registered: include driver+vehicle
+         * not registered: plate-only (driver/vehicle null)
     """
     global gate_state, current_registered_gate_state, current_registered_ts
 
     now_ms = int(time.time() * 1000)
     vehicle_count = len(vehicles)
 
-    # ---------------------------------------------
-    # A. If we already have a registered vehicle, apply lock rules
-    # ---------------------------------------------
+    # --- lock rules (unchanged) ---
     if current_registered_gate_state is not None:
         lock_age = now_ms - current_registered_ts
 
-        # A1: Vehicle still present & within PASS_LOCK_MS -> keep registered state
         if vehicle_count > 0 and lock_age <= PASS_LOCK_MS:
-            gate_state = {
-                **current_registered_gate_state,
-                "vehicleFound": True,
-                "lastUpdate": now_ms,
-            }
+            gate_state = {**current_registered_gate_state, "vehicleFound": True, "lastUpdate": now_ms}
             try:
                 pusher_client.trigger("gate-channel", "gate-update", gate_state)
             except Exception as e:
                 print("[Pusher] Error (lock, vehicle present):", e)
-            print("[GateState] LOCK active (vehicle present). gate_state:", gate_state)
             return gate_state
 
-        # A2: No vehicle present, but we keep showing last state for CLEAR_AFTER_MS
         if vehicle_count == 0:
             last_update = gate_state.get("lastUpdate") or current_registered_ts
             if now_ms - last_update <= CLEAR_AFTER_MS:
-                # Keep last gate_state, just rebroadcast
                 try:
                     pusher_client.trigger("gate-channel", "gate-update", gate_state)
                 except Exception as e:
                     print("[Pusher] Error (lock, smooth clear window):", e)
-                print("[GateState] LOCK smooth clear (no vehicle, but within CLEAR_AFTER_MS). gate_state:", gate_state)
                 return gate_state
 
-        # A3: Lock expired + either no vehicle or a new scenario -> clear lock and continue
-        print("[GateState] LOCK expired or new cycle. Clearing current_registered_*")
         current_registered_gate_state = None
         current_registered_ts = 0
-        # fall through to normal logic below
 
-    # ---------------------------------------------
-    # B. No active lock (normal logic)
-    # ---------------------------------------------
-
-    # B1: No vehicles & no plates at all
-    print("# B1) No vehicles & no plates")
+    # --- no vehicles & no plates ---
     if (not vehicles) and (not plates):
         last_update = gate_state.get("lastUpdate")
-        # If we had a previous vehicle, keep it for CLEAR_AFTER_MS
         if gate_state.get("vehicleFound") and last_update and (now_ms - last_update <= CLEAR_AFTER_MS):
             try:
                 pusher_client.trigger("gate-channel", "gate-update", gate_state)
             except Exception as e:
                 print("[Pusher] Error (B1 smooth no-vehicle window):", e)
-            print("[GateState] B1 smooth hold (no vehicles/plates but within CLEAR_AFTER_MS). gate_state:", gate_state)
             return gate_state
 
-        # Otherwise, hard reset
-        gate_state = {
-            "vehicleFound": False,
-            "plate": None,
-            "driver": None,
-            "vehicle": None,
-            "lastUpdate": None,
-        }
+        gate_state = {"vehicleFound": False, "plate": None, "driver": None, "vehicle": None, "lastUpdate": None}
         try:
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B1 reset):", e)
-        print("[GateState] B1 reset. gate_state:", gate_state)
         return gate_state
 
-    # B2: Vehicles found but no plates
-    print("# B2) Vehicles found but no plates")
+    # --- vehicles but no plates ---
     if vehicles and not plates:
-        # Just mark vehicle present but unknown
         gate_state = {
             "vehicleFound": True,
-            "plate": gate_state.get("plate"),   # keep last plate if any
-            "driver": gate_state.get("driver"), # keep last driver if any
+            "plate": gate_state.get("plate"),
+            "driver": gate_state.get("driver"),
             "vehicle": gate_state.get("vehicle"),
             "lastUpdate": now_ms,
         }
@@ -577,15 +600,14 @@ async def update_gate_state_and_push(
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B2 vehicles only):", e)
-        print("[GateState] B2 vehicles only. gate_state:", gate_state)
         return gate_state
 
-    # B3: We have plates; normalize for DB search
     cleaned_plates = normalize_plate_text(plates)
+    best_plate_text, best_plate_conf = pick_best_plate_text_and_conf(plates)
+    ai_conf_bigint = to_ai_confidence_bigint(best_plate_conf)
+    image_preview = build_image_preview_url(camera_source)
 
-    print("# B3) We have plates; normalize for DB search")
     if not cleaned_plates:
-        # behave like "vehicles only" if plate texts are empty
         gate_state = {
             "vehicleFound": vehicle_count > 0,
             "plate": gate_state.get("plate"),
@@ -597,24 +619,20 @@ async def update_gate_state_and_push(
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B3 no cleaned plates):", e)
-        print("[GateState] B3 no cleaned plates. gate_state:", gate_state)
         return gate_state
 
-    # B4: DB lookup (PostgreSQL, same logic as Node with UNNEST)
-    print("# B4) DB lookup (PostgreSQL, same logic as Node with UNNEST)")
+    # --- DB lookup (registered?) ---
     try:
         sql = """
             SELECT v.*, p.cleaned_input
             FROM dbo."Vehicles" v
             CROSS JOIN UNNEST($1::text[]) AS p(cleaned_input)
-            WHERE 
+            WHERE
                 LOWER(REPLACE(REPLACE(v."PlateNumber", ' ', ''), '-', '')) = p.cleaned_input
                 AND v."Active" = true
             LIMIT 1
         """
-        print("[GateState] running DB query with:", cleaned_plates)
         rows = await db_query(sql, [cleaned_plates])
-        print("[GateState] DB rows count:", len(rows))
     except Exception as db_err:
         print("[GateState] DB error:", db_err)
         gate_state = {
@@ -628,46 +646,91 @@ async def update_gate_state_and_push(
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B4 DB error):", e)
-        print("[GateState] B4 DB error. gate_state:", gate_state)
         return gate_state
 
+    # Helper: apply 5-minute skip rule for ANY plate
+    async def should_insert_log(plate_number: str) -> bool:
+        try:
+            last_ts_ms = await get_last_log_time_ms_for_plate(plate_number)
+            if last_ts_ms is not None and (now_ms - last_ts_ms) <= LOG_WINDOW_MS:
+                return False
+            return True
+        except Exception as e:
+            print("[Logs] 5-min check failed; allowing insert:", e)
+            return True
+
+    # =========================================================
+    # NOT REGISTERED
+    # =========================================================
     if not rows:
-        # No registered vehicle found for these plates
-        gate_state = {
-            "vehicleFound": vehicle_count > 0,
-            "plate": None,
-            "driver": None,
-            "vehicle": None,
-            "lastUpdate": now_ms,
-        }
+        if best_plate_text:
+            try:
+                if await should_insert_log(best_plate_text):
+                    await insert_log_row(
+                        plate_number=best_plate_text,
+                        driver_json=None,
+                        vehicle_json=None,
+                        role_type="Visitors",
+                        verification="NOT REGISTERED",
+                        camera_source=camera_source,
+                        image_preview=image_preview,
+                        ai_confidence=ai_conf_bigint,
+                    )
+                    print(f'[Logs] NOT REGISTERED log inserted for {best_plate_text}')
+                else:
+                    print(f'[Logs] NOT REGISTERED log skipped (<5min) for {best_plate_text}')
+            except Exception as e:
+                print("[Logs] Failed to write NOT REGISTERED Logs row:", e)
+
+        gate_state = {"vehicleFound": vehicle_count > 0, "plate": None, "driver": None, "vehicle": None, "lastUpdate": now_ms}
         try:
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B4 no rows):", e)
-        print("[GateState] B4 no rows. gate_state:", gate_state)
         return gate_state
 
-    # B5: Registered vehicle found -> set LOCK and gate_state
+    # =========================================================
+    # REGISTERED
+    # =========================================================
     vehicle_details = rows[0]
-    print("[GateState] vehicle_details row:", vehicle_details)
 
     raw_driver = vehicle_details.get("Driver")
     if isinstance(raw_driver, str):
         try:
             raw_driver = json.loads(raw_driver)
         except Exception:
-            print("[GateState] Warning: Driver JSON could not be parsed")
+            raw_driver = None
 
-    # Build new state
+    registered_plate = vehicle_details.get("PlateNumber") or best_plate_text or ""
+    vehicle_json = {
+        "brand": vehicle_details.get("Brand"),
+        "model": vehicle_details.get("Model"),
+        "type": vehicle_details.get("Type"),
+    }
+
+    try:
+        if registered_plate and await should_insert_log(registered_plate):
+            await insert_log_row(
+                plate_number=registered_plate,
+                driver_json=raw_driver,          # registered: always include details (when inserting)
+                vehicle_json=vehicle_json,
+                role_type=(raw_driver or {}).get("RoleType") if isinstance(raw_driver, dict) and (raw_driver or {}).get("RoleType") else None,
+                verification="REGISTERED",
+                camera_source=camera_source,
+                image_preview=image_preview,
+                ai_confidence=ai_conf_bigint,
+            )
+            print(f'[Logs] REGISTERED log inserted for {registered_plate}')
+        else:
+            print(f'[Logs] REGISTERED log skipped (<5min) for {registered_plate}')
+    except Exception as e:
+        print("[Logs] Failed to write REGISTERED Logs row:", e)
+
     new_state = {
         "vehicleFound": True,
-        "plate": vehicle_details.get("PlateNumber"),
+        "plate": registered_plate,
         "driver": raw_driver,
-        "vehicle": {
-            "brand": vehicle_details.get("Brand"),
-            "model": vehicle_details.get("Model"),
-            "type": vehicle_details.get("Type"),
-        },
+        "vehicle": vehicle_json,
         "lastUpdate": now_ms,
     }
 
@@ -678,9 +741,8 @@ async def update_gate_state_and_push(
     try:
         pusher_client.trigger("gate-channel", "gate-update", gate_state)
     except Exception as e:
-        print("[Pusher] Error (B5 final trigger):", e)
+        print("[Pusher] Error (registered trigger):", e)
 
-    print("[GateState] B5 registered & LOCK set. gate_state:", gate_state)
     return gate_state
 
 
@@ -695,6 +757,7 @@ async def health():
         "device": DEVICE,
         "yolo_model": YOLO_MODEL_PATH,
         "database_url": DATABASE_URL is not None,
+        "public_base_url": PUBLIC_BASE_URL or None,
     }
 
 
@@ -705,27 +768,12 @@ async def alpr_models():
 
 # ---------------------------------------------------------
 # /stream-frame (mobile → server frame upload)
-# Node streamFrameHandler equivalent
 # ---------------------------------------------------------
-
 @app.post("/stream-frame")
 async def stream_frame(
     frame: UploadFile = File(...),
-    stream_id: Optional[str] = None,
+    stream_id: Optional[str] = Form(None),
 ):
-    """
-    Receives a single image frame from mobile, stores it in memory per stream_id,
-    and notifies listeners via Pusher with metadata only.
-
-    Node JS equivalent:
-
-      const { buffer, mimetype } = req.file;
-      const streamId = req.body.stream_id || "mobile-1";
-      const ct = mimetype || "image/jpeg";
-      const ts = Date.now();
-      latestFrames.set(streamId, { buffer, mimetype: ct, ts });
-      await pusher.trigger("video-channel", "frame", { stream_id: streamId, ts });
-    """
     if not frame:
         raise HTTPException(status_code=400, detail="frame is required")
 
@@ -737,19 +785,10 @@ async def stream_frame(
     ct = frame.content_type or "image/jpeg"
     ts = int(time.time() * 1000)
 
-    # 1) Store latest frame in memory
-    latest_frames[sid] = {
-        "buffer": data,
-        "mimetype": ct,
-        "ts": ts,
-    }
+    latest_frames[sid] = {"buffer": data, "mimetype": ct, "ts": ts}
 
-    # 2) Notify via Pusher (metadata only)
     try:
-        pusher_client.trigger("video-channel", "frame", {
-            "stream_id": sid,
-            "ts": ts,
-        })
+        pusher_client.trigger("video-channel", "frame", {"stream_id": sid, "ts": ts})
     except Exception as e:
         print("[/stream-frame] Pusher error:", e)
 
@@ -758,23 +797,9 @@ async def stream_frame(
 
 # ---------------------------------------------------------
 # /latest-frame (web → server)
-# Node getLatestFrameHandler equivalent
 # ---------------------------------------------------------
-
 @app.get("/latest-frame")
 async def get_latest_frame(stream_id: str = Query("mobile-1")):
-    """
-    Returns the raw bytes of the latest frame for given stream_id.
-
-    Node JS equivalent:
-
-      const streamId = (req.query.stream_id || "mobile-1").toString();
-      const frame = latestFrames.get(streamId);
-      if (!frame) 404 "No frame yet";
-      res.setHeader("Content-Type", frame.mimetype || "image/jpeg");
-      res.setHeader("Cache-Control", "no-store");
-      res.send(frame.buffer);
-    """
     frame = latest_frames.get(stream_id)
     if not frame:
         raise HTTPException(status_code=404, detail="No frame yet")
@@ -782,28 +807,21 @@ async def get_latest_frame(stream_id: str = Query("mobile-1")):
     mimetype = frame.get("mimetype") or "image/jpeg"
     buffer = frame.get("buffer") or b""
 
-    headers = {
-        "Cache-Control": "no-store",
-        # Add if dashboard is on a different origin:
-        # "Access-Control-Allow-Origin": "*",
-    }
-
+    headers = {"Cache-Control": "no-store"}
     return Response(content=buffer, media_type=mimetype, headers=headers)
 
 
 # ---------------------------------------------------------
-# /detect (unchanged; ALPR + YOLO)
+# /detect (ALPR + YOLO)
 # ---------------------------------------------------------
-
 @app.post("/detect")
 async def detect_all(
     file: UploadFile = File(...),
     detector_model: Optional[DetectorName] = None,
     ocr_model: Optional[OcrName] = None,
-    # Optional stream_id to mirror Node signature (not used in logic yet)
-    stream_id: Optional[str] = None,
+    stream_id: Optional[str] = Form(None),
 ):
-    if not file.content_type.startswith("image/"):
+    if not file.content_type or not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image.")
 
     detector_name = detector_model or DETECTOR_MODELS[0]
@@ -816,13 +834,14 @@ async def detect_all(
     img_np = load_image_to_numpy(data)
     h, w = img_np.shape[:2]
 
+    sid = stream_id or "mobile-1"
+
     t0 = time.time()
     vehicles = run_yolo_vehicles(img_np)
     alpr_result = run_alpr(img_np, detector_name, ocr_name)
     plates = alpr_result["plates"]
 
-    # apply gateState logic and push update BEFORE responding
-    gate = await update_gate_state_and_push(vehicles, plates)
+    gate = await update_gate_state_and_push(vehicles, plates, camera_source=sid)
 
     t1 = time.time()
 
@@ -837,6 +856,6 @@ async def detect_all(
             "yolo_model": YOLO_MODEL_PATH,
             "total_time_ms": (t1 - t0) * 1000.0,
             "gate_state": gate,
-            "stream_id": stream_id,
+            "stream_id": sid,
         }
     )
