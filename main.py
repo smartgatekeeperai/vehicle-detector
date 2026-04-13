@@ -97,9 +97,14 @@ SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))
 DETECTOR_MODELS: List[PlateDetectorModel] = list(get_args(PlateDetectorModel))
 OCR_MODELS: List[OcrModel] = list(get_args(OcrModel))
 
-if "cct-s-v1-global-model" in OCR_MODELS:
-    OCR_MODELS.remove("cct-s-v1-global-model")
-    OCR_MODELS.insert(0, "cct-s-v1-global-model")
+# Prefer newer v2 OCR models first
+if "cct-xs-v2-global-model" in OCR_MODELS:
+    OCR_MODELS.remove("cct-xs-v2-global-model")
+    OCR_MODELS.insert(0, "cct-xs-v2-global-model")
+elif "cct-s-v2-global-model" in OCR_MODELS:
+    OCR_MODELS.remove("cct-s-v2-global-model")
+    OCR_MODELS.insert(0, "cct-s-v2-global-model")
+
 
 DetectorName = Literal[tuple(DETECTOR_MODELS)]  # type: ignore
 OcrName = Literal[tuple(OCR_MODELS)]  # type: ignore
