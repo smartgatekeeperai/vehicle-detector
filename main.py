@@ -33,6 +33,14 @@ from fast_alpr import ALPR
 from fast_alpr.default_detector import PlateDetectorModel
 from fast_alpr.default_ocr import OcrModel
 
+# =========================================================
+# OPTIONAL SERIAL (PC -> Pico)
+# =========================================================
+try:
+    import serial  # pip install pyserial
+except Exception:
+    serial = None
+
 
 # =========================================================
 # CONFIG
@@ -70,6 +78,15 @@ LOG_WINDOW_MS = 5 * 60 * 1000
 # Used for ImagePreview in Logs
 # Example: https://your-space.hf.space  or https://your-domain.com
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+
+# =========================================================
+# SERIAL CONFIG (PICO CONTROL)
+# =========================================================
+SERIAL_ENABLED = os.getenv("SERIAL_ENABLED", "false").lower() == "true"
+SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")  # Windows: COM5, Linux: /dev/ttyACM0
+SERIAL_BAUDRATE = int(os.getenv("SERIAL_BAUDRATE", "115200"))
+SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "1"))
+SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))  # Pico may reset on open
 
 
 # =========================================================
@@ -474,6 +491,68 @@ def build_image_preview_url(stream_id: str) -> str:
 
 
 # =========================================================
+# SERIAL HELPERS
+# =========================================================
+
+last_serial_command: Optional[str] = None
+
+
+def is_gate_verified_open(gate: Dict[str, Any]) -> bool:
+    """
+    GREEN only if:
+    - gate has vehicleFound = True
+    - verified/registered vehicle exists (plate is present)
+    """
+    return bool(
+        gate.get("vehicleFound") is True
+        and gate.get("plate")
+    )
+
+
+def get_pico_command_from_gate(gate: Dict[str, Any]) -> str:
+    """
+    Requested behavior:
+    - green only if gate is open && vehicle is verified after detected
+    - red if gate is close or no vehicle detected
+    - if vehicle is detected but not found, do not go green
+    """
+    if is_gate_verified_open(gate):
+        return "green"
+    return "red"
+
+
+def send_serial_command_to_pico(command: str) -> None:
+    global last_serial_command
+
+    if not SERIAL_ENABLED:
+        print(f"[SERIAL] Skipped (disabled): {command}")
+        return
+
+    if serial is None:
+        print("[SERIAL] pyserial is not installed. Run: pip install pyserial")
+        return
+
+    command = (command or "").strip().lower()
+    if not command:
+        return
+
+    # Avoid unnecessary repeated sends
+    # if last_serial_command == command:
+    #     print(f"[SERIAL] Skipped duplicate command: {command}")
+    #     return
+
+    try:
+        with serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT) as ser:
+            time.sleep(SERIAL_OPEN_DELAY)  # Pico USB serial may reset on open
+            ser.write((command + "\n").encode("utf-8"))
+            ser.flush()
+            last_serial_command = command
+            print(f"[SERIAL] Sent to Pico: {command}")
+    except Exception as e:
+        print(f"[SERIAL] Failed to send '{command}' to Pico: {e}")
+
+
+# =========================================================
 # LOGGING HELPERS (dbo."Logs")
 # NOTE: For 5-minute checks, your table must have "CreatedAt".
 # =========================================================
@@ -758,6 +837,8 @@ async def health():
         "yolo_model": YOLO_MODEL_PATH,
         "database_url": DATABASE_URL is not None,
         "public_base_url": PUBLIC_BASE_URL or None,
+        "serial_enabled": SERIAL_ENABLED,
+        "serial_port": SERIAL_PORT if SERIAL_ENABLED else None,
     }
 
 
@@ -843,6 +924,9 @@ async def detect_all(
 
     gate = await update_gate_state_and_push(vehicles, plates, camera_source=sid)
 
+    pico_command = get_pico_command_from_gate(gate)
+    send_serial_command_to_pico(pico_command)
+
     t1 = time.time()
 
     return JSONResponse(
@@ -856,6 +940,7 @@ async def detect_all(
             "yolo_model": YOLO_MODEL_PATH,
             "total_time_ms": (t1 - t0) * 1000.0,
             "gate_state": gate,
+            "pico_command": pico_command,
             "stream_id": sid,
         }
     )

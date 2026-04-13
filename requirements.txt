@@ -30,3 +30,5 @@ pusher==3.3.2
 
 # --- Env loader ---
 python-dotenv==1.0.1
+
+pyserial==3.5.0

@@ -1,5 +1,6 @@
 |-- .env
 |-- .gitignore
+|-- howtorunlocal.txt
 |-- LICENSE
 |-- main.py
 |-- README.md
