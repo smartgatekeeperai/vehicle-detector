@@ -3,10 +3,12 @@ import io
 import os
 import time
 import json
+import tempfile
+import traceback
 from functools import lru_cache
 from typing import List, Optional, Literal, get_args, Any, Dict, Tuple
 
-from dotenv import load_dotenv  # Load env vars from .env
+from dotenv import load_dotenv
 
 # ---------------------------------------------------------
 # Load .env (current dir + parent, to catch root .env)
@@ -46,9 +48,9 @@ except Exception:
 # CONFIG
 # =========================================================
 
-YOLO_MODEL_PATH = "yolov8x.pt"
+YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8x.pt")
 
-# COCO vehicle class IDs (YOLOv8 + COCO)
+# COCO vehicle class IDs
 # 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 
@@ -64,39 +66,37 @@ VEHICLE_CLASS_NAMES = {
     25: "suv",
 }
 
-CONF_THRESHOLD = 0.5
-IOU_THRESHOLD = 0.5
-HOLD_SECONDS = 0.7  # smoothing window for vehicles (YOLO)
+CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.5"))
+IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.5"))
+HOLD_SECONDS = float(os.getenv("HOLD_SECONDS", "0.7"))
 
 # Gate smoothing / lock behavior
-PASS_LOCK_MS = 10_000   # keep registered state for up to 10s while vehicle present
-CLEAR_AFTER_MS = 5_000  # keep last state for up to 5s after vehicle disappears
+PASS_LOCK_MS = int(os.getenv("PASS_LOCK_MS", "10000"))
+CLEAR_AFTER_MS = int(os.getenv("CLEAR_AFTER_MS", "5000"))
 
 # Logging window rule (5 minutes)
-LOG_WINDOW_MS = 5 * 60 * 1000
+LOG_WINDOW_MS = int(os.getenv("LOG_WINDOW_MS", str(5 * 60 * 1000)))
 
 # Used for ImagePreview in Logs
-# Example: https://your-space.hf.space  or https://your-domain.com
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+
 
 # =========================================================
 # SERIAL CONFIG (PICO CONTROL)
 # =========================================================
 SERIAL_ENABLED = os.getenv("SERIAL_ENABLED", "false").lower() == "true"
-SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")  # Windows: COM5, Linux: /dev/ttyACM0
+SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")
 SERIAL_BAUDRATE = int(os.getenv("SERIAL_BAUDRATE", "115200"))
 SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "1"))
-SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))  # Pico may reset on open
+SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))
 
 
 # =========================================================
 # FASTALPR CONFIG (PLATES)
 # =========================================================
-
 DETECTOR_MODELS: List[PlateDetectorModel] = list(get_args(PlateDetectorModel))
 OCR_MODELS: List[OcrModel] = list(get_args(OcrModel))
 
-# (optional) Move a specific OCR model to front if desired
 if "cct-s-v1-global-model" in OCR_MODELS:
     OCR_MODELS.remove("cct-s-v1-global-model")
     OCR_MODELS.insert(0, "cct-s-v1-global-model")
@@ -117,7 +117,6 @@ def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
 # =========================================================
 # APP
 # =========================================================
-
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8x + FastALPR",
     version="1.0.0",
@@ -135,9 +134,8 @@ app.add_middleware(
 # =========================================================
 # DEVICE + YOLO MODEL
 # =========================================================
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[INIT] Loading YOLOv8 model on device: {DEVICE}")
+print(f"[INIT] Loading YOLO model on device: {DEVICE}")
 yolo_model = YOLO(YOLO_MODEL_PATH)
 yolo_model.to(DEVICE)
 
@@ -145,31 +143,27 @@ yolo_model.to(DEVICE)
 # =========================================================
 # GATE STATE (GLOBAL)
 # =========================================================
-
 gate_state: Dict[str, Any] = {
     "vehicleFound": False,
     "plate": None,
     "driver": None,
     "vehicle": None,
-    "lastUpdate": None,  # ms epoch
+    "lastUpdate": None,
 }
 
 current_registered_gate_state: Optional[Dict[str, Any]] = None
-current_registered_ts: int = 0  # ms epoch when registered plate was confirmed
+current_registered_ts: int = 0
 
 
 # =========================================================
-# LATEST FRAMES (Node-style latestFrames = new Map())
+# LATEST FRAMES
 # =========================================================
-
-# Key: stream_id -> { "buffer": bytes, "mimetype": str, "ts": int }
 latest_frames: Dict[str, Dict[str, Any]] = {}
 
 
 # =========================================================
 # DB (PostgreSQL)
 # =========================================================
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
@@ -181,14 +175,14 @@ if not DATABASE_URL:
 
     if DB_USER and DB_NAME:
         DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-        print("[DB] Constructed DATABASE_URL from DB_* env vars:", DATABASE_URL)
+        print("[DB] Constructed DATABASE_URL from DB_* env vars")
     else:
         print("[DB] Missing DB_USER or DB_NAME; cannot construct DATABASE_URL.")
 
 if DATABASE_URL:
-    print("[DB] Using DATABASE_URL:", DATABASE_URL)
+    print("[DB] Using DATABASE_URL")
 else:
-    print("[DB] DATABASE_URL is still not set. DB queries will fail.")
+    print("[DB] DATABASE_URL is not set. DB queries will fail.")
 
 
 @app.on_event("startup")
@@ -196,25 +190,38 @@ async def startup():
     if not DATABASE_URL:
         print("[WARN] DATABASE_URL is not set; DB queries will fail.")
         return
-    app.state.db_pool = await asyncpg.create_pool(DATABASE_URL)
-    print("[INIT] asyncpg pool created")
+
+    try:
+        app.state.db_pool = await asyncpg.create_pool(DATABASE_URL)
+        print("[INIT] asyncpg pool created")
+    except Exception as e:
+        print("[DB] Failed to create pool:", e)
+        app.state.db_pool = None
 
 
-async def db_query(sql: str, params: List[Any] = None) -> List[Dict[str, Any]]:
+@app.on_event("shutdown")
+async def shutdown():
+    pool = getattr(app.state, "db_pool", None)
+    if pool is not None:
+        await pool.close()
+        print("[DB] Pool closed")
+
+
+async def db_query(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
     params = params or []
     pool = getattr(app.state, "db_pool", None)
     if pool is None:
-        raise RuntimeError("DB pool is not initialized. Set DATABASE_URL and ensure startup event runs.")
+        raise RuntimeError("DB pool is not initialized.")
     async with pool.acquire() as conn:
         rows = await conn.fetch(sql, *params)
         return [dict(r) for r in rows]
 
 
-async def db_execute(sql: str, params: List[Any] = None) -> None:
+async def db_execute(sql: str, params: Optional[List[Any]] = None) -> None:
     params = params or []
     pool = getattr(app.state, "db_pool", None)
     if pool is None:
-        raise RuntimeError("DB pool is not initialized. Set DATABASE_URL and ensure startup event runs.")
+        raise RuntimeError("DB pool is not initialized.")
     async with pool.acquire() as conn:
         await conn.execute(sql, *params)
 
@@ -222,7 +229,6 @@ async def db_execute(sql: str, params: List[Any] = None) -> None:
 # =========================================================
 # PUSHER CLIENT
 # =========================================================
-
 PUSHER_APP_ID = os.getenv("PUSHER_APP_ID")
 PUSHER_KEY = os.getenv("PUSHER_KEY", "")
 PUSHER_SECRET = os.getenv("PUSHER_SECRET", "")
@@ -231,7 +237,12 @@ PUSHER_HOST = os.getenv("PUSHER_HOST")
 PUSHER_PORT = os.getenv("PUSHER_PORT")
 USE_LOCAL_PUSHER = os.getenv("USE_LOCAL_PUSHER", "false").lower() == "true"
 
-is_local_env = os.getenv("VERCEL") != "1" and os.getenv("NODE_ENV") != "production"
+# Hugging Face is not local
+is_local_env = (
+    os.getenv("SPACE_ID") is None
+    and os.getenv("VERCEL") != "1"
+    and os.getenv("NODE_ENV") != "production"
+)
 
 print(
     "[Pusher] env values:",
@@ -246,7 +257,7 @@ print(
 )
 
 if not PUSHER_APP_ID or PUSHER_APP_ID.strip() == "":
-    print("[WARN] PUSHER_APP_ID is not set or invalid. Using DummyPusher (no real-time events).")
+    print("[WARN] PUSHER_APP_ID is not set or invalid. Using DummyPusher.")
 
     class DummyPusher:
         def trigger(self, channel, event, data):
@@ -272,13 +283,12 @@ else:
         print(f"[Pusher] Using CLOUD (cluster={PUSHER_CLUSTER}, TLS=True)")
 
     pusher_client = Pusher(**client_kwargs)
-    print("[INIT] Pusher client initialized:", client_kwargs)
+    print("[INIT] Pusher client initialized")
 
 
 # =========================================================
 # Pydantic Models
 # =========================================================
-
 class VehicleBBox(BaseModel):
     x1: float
     y1: float
@@ -308,7 +318,6 @@ LAST_VEHICLE_TS: float = 0.0
 # =========================================================
 # HELPERS (Image / YOLO / ALPR)
 # =========================================================
-
 def load_image_to_numpy(data: bytes) -> np.ndarray:
     try:
         img = Image.open(io.BytesIO(data)).convert("RGB")
@@ -329,11 +338,18 @@ def build_vehicle_bbox(x1: float, y1: float, x2: float, y2: float, image_w: int,
     nheight = height / image_h
 
     return VehicleBBox(
-        x1=x1, y1=y1, x2=x2, y2=y2,
-        width=width, height=height,
-        cx=cx, cy=cy,
-        nx=nx, ny=ny,
-        nwidth=nwidth, nheight=nheight,
+        x1=x1,
+        y1=y1,
+        x2=x2,
+        y2=y2,
+        width=width,
+        height=height,
+        cx=cx,
+        cy=cy,
+        nx=nx,
+        ny=ny,
+        nwidth=nwidth,
+        nheight=nheight,
     )
 
 
@@ -406,7 +422,10 @@ def serialize_alpr_result(result) -> dict:
             conf_val = float(sum(raw_conf) / len(raw_conf)) if raw_conf else 0.0
         else:
             conf_val = float(raw_conf or 0.0)
-        ocr = {"text": getattr(ocr_obj, "text", None), "confidence": conf_val}
+        ocr = {
+            "text": getattr(ocr_obj, "text", None),
+            "confidence": conf_val,
+        }
 
     bbox = None
     detection = getattr(result, "detection", None)
@@ -429,13 +448,36 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str) -> dict:
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    temp_path = None
     try:
-        results = alpr.predict(img_np)
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            temp_path = tmp.name
+
+        Image.fromarray(img_np).save(temp_path, format="JPEG")
+
+        # Hugging Face-safe path input for FastALPR
+        results = alpr.predict(temp_path)
+
     except Exception as e:
+        print("[ALPR] Full traceback:")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"ALPR error: {e}")
 
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+
     plates = [serialize_alpr_result(r) for r in results] if results else []
-    return {"model": {"detector_model": detector_name, "ocr_model": ocr_name}, "plates": plates}
+    return {
+        "model": {
+            "detector_model": detector_name,
+            "ocr_model": ocr_name,
+        },
+        "plates": plates,
+    }
 
 
 def normalize_plate_text(plates: List[dict]) -> List[str]:
@@ -453,6 +495,7 @@ def normalize_plate_text(plates: List[dict]) -> List[str]:
             .lower()
         )
         cleaned.append(normalized)
+
     print("[GateState] cleaned_plates:", cleaned)
     return cleaned
 
@@ -460,24 +503,27 @@ def normalize_plate_text(plates: List[dict]) -> List[str]:
 def pick_best_plate_text_and_conf(plates: List[dict]) -> Tuple[Optional[str], float]:
     best_text = None
     best_conf = 0.0
+
     for p in plates or []:
-        ocr = (p.get("ocr") or {})
+        ocr = p.get("ocr") or {}
         text = ocr.get("text")
         conf = ocr.get("confidence")
         if not text:
             continue
+
         try:
             conf_val = float(conf) if conf is not None else 0.0
         except Exception:
             conf_val = 0.0
+
         if conf_val > best_conf:
             best_conf = conf_val
             best_text = text
+
     return best_text, best_conf
 
 
 def to_ai_confidence_bigint(best_conf_0_1: float) -> int:
-    # store 0..100 (bigint)
     if best_conf_0_1 < 0:
         best_conf_0_1 = 0.0
     if best_conf_0_1 > 1:
@@ -493,16 +539,10 @@ def build_image_preview_url(stream_id: str) -> str:
 # =========================================================
 # SERIAL HELPERS
 # =========================================================
-
 last_serial_command: Optional[str] = None
 
 
 def is_gate_verified_open(gate: Dict[str, Any]) -> bool:
-    """
-    GREEN only if:
-    - gate has vehicleFound = True
-    - verified/registered vehicle exists (plate is present)
-    """
     return bool(
         gate.get("vehicleFound") is True
         and gate.get("plate")
@@ -510,12 +550,6 @@ def is_gate_verified_open(gate: Dict[str, Any]) -> bool:
 
 
 def get_pico_command_from_gate(gate: Dict[str, Any]) -> str:
-    """
-    Requested behavior:
-    - green only if gate is open && vehicle is verified after detected
-    - red if gate is close or no vehicle detected
-    - if vehicle is detected but not found, do not go green
-    """
     if is_gate_verified_open(gate):
         return "green"
     return "red"
@@ -529,21 +563,16 @@ def send_serial_command_to_pico(command: str) -> None:
         return
 
     if serial is None:
-        print("[SERIAL] pyserial is not installed. Run: pip install pyserial")
+        print("[SERIAL] pyserial is not installed.")
         return
 
     command = (command or "").strip().lower()
     if not command:
         return
 
-    # Avoid unnecessary repeated sends
-    # if last_serial_command == command:
-    #     print(f"[SERIAL] Skipped duplicate command: {command}")
-    #     return
-
     try:
         with serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT) as ser:
-            time.sleep(SERIAL_OPEN_DELAY)  # Pico USB serial may reset on open
+            time.sleep(SERIAL_OPEN_DELAY)
             ser.write((command + "\n").encode("utf-8"))
             ser.flush()
             last_serial_command = command
@@ -553,10 +582,8 @@ def send_serial_command_to_pico(command: str) -> None:
 
 
 # =========================================================
-# LOGGING HELPERS (dbo."Logs")
-# NOTE: For 5-minute checks, your table must have "CreatedAt".
+# LOGGING HELPERS
 # =========================================================
-
 async def get_last_log_time_ms_for_plate(plate_text: str) -> Optional[int]:
     try:
         sql = """
@@ -572,7 +599,7 @@ async def get_last_log_time_ms_for_plate(plate_text: str) -> Optional[int]:
         ts_ms = rows[0].get("ts_ms")
         return int(ts_ms) if ts_ms is not None else None
     except Exception as e:
-        print('[Logs] Warning: get_last_log_time_ms_for_plate failed (missing "CreatedAt"?):', e)
+        print('[Logs] Warning: get_last_log_time_ms_for_plate failed:', e)
         return None
 
 
@@ -580,7 +607,7 @@ async def insert_log_row(
     plate_number: str,
     driver_json: Optional[dict],
     vehicle_json: Optional[dict],
-    role_type: str,
+    role_type: Optional[str],
     verification: str,
     camera_source: str,
     image_preview: str,
@@ -605,32 +632,27 @@ async def insert_log_row(
 
 
 # =========================================================
-# GATE STATE LOGIC (lock + smooth clear + logging)
+# GATE STATE LOGIC
 # =========================================================
-
 async def update_gate_state_and_push(
     vehicles: List[VehicleDetection],
     plates: List[dict],
     camera_source: str,
 ) -> Dict[str, Any]:
-    """
-    Logging (5-min rule applies to BOTH registered and not-registered):
-      - if last log for that plate was within 5 min -> SKIP INSERT
-      - else INSERT:
-         * registered: include driver+vehicle
-         * not registered: plate-only (driver/vehicle null)
-    """
     global gate_state, current_registered_gate_state, current_registered_ts
 
     now_ms = int(time.time() * 1000)
     vehicle_count = len(vehicles)
 
-    # --- lock rules (unchanged) ---
     if current_registered_gate_state is not None:
         lock_age = now_ms - current_registered_ts
 
         if vehicle_count > 0 and lock_age <= PASS_LOCK_MS:
-            gate_state = {**current_registered_gate_state, "vehicleFound": True, "lastUpdate": now_ms}
+            gate_state = {
+                **current_registered_gate_state,
+                "vehicleFound": True,
+                "lastUpdate": now_ms,
+            }
             try:
                 pusher_client.trigger("gate-channel", "gate-update", gate_state)
             except Exception as e:
@@ -649,7 +671,6 @@ async def update_gate_state_and_push(
         current_registered_gate_state = None
         current_registered_ts = 0
 
-    # --- no vehicles & no plates ---
     if (not vehicles) and (not plates):
         last_update = gate_state.get("lastUpdate")
         if gate_state.get("vehicleFound") and last_update and (now_ms - last_update <= CLEAR_AFTER_MS):
@@ -659,14 +680,19 @@ async def update_gate_state_and_push(
                 print("[Pusher] Error (B1 smooth no-vehicle window):", e)
             return gate_state
 
-        gate_state = {"vehicleFound": False, "plate": None, "driver": None, "vehicle": None, "lastUpdate": None}
+        gate_state = {
+            "vehicleFound": False,
+            "plate": None,
+            "driver": None,
+            "vehicle": None,
+            "lastUpdate": None,
+        }
         try:
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B1 reset):", e)
         return gate_state
 
-    # --- vehicles but no plates ---
     if vehicles and not plates:
         gate_state = {
             "vehicleFound": True,
@@ -700,7 +726,6 @@ async def update_gate_state_and_push(
             print("[Pusher] Error (B3 no cleaned plates):", e)
         return gate_state
 
-    # --- DB lookup (registered?) ---
     try:
         sql = """
             SELECT v.*, p.cleaned_input
@@ -727,7 +752,6 @@ async def update_gate_state_and_push(
             print("[Pusher] Error (B4 DB error):", e)
         return gate_state
 
-    # Helper: apply 5-minute skip rule for ANY plate
     async def should_insert_log(plate_number: str) -> bool:
         try:
             last_ts_ms = await get_last_log_time_ms_for_plate(plate_number)
@@ -738,9 +762,6 @@ async def update_gate_state_and_push(
             print("[Logs] 5-min check failed; allowing insert:", e)
             return True
 
-    # =========================================================
-    # NOT REGISTERED
-    # =========================================================
     if not rows:
         if best_plate_text:
             try:
@@ -755,22 +776,25 @@ async def update_gate_state_and_push(
                         image_preview=image_preview,
                         ai_confidence=ai_conf_bigint,
                     )
-                    print(f'[Logs] NOT REGISTERED log inserted for {best_plate_text}')
+                    print(f"[Logs] NOT REGISTERED log inserted for {best_plate_text}")
                 else:
-                    print(f'[Logs] NOT REGISTERED log skipped (<5min) for {best_plate_text}')
+                    print(f"[Logs] NOT REGISTERED log skipped (<5min) for {best_plate_text}")
             except Exception as e:
                 print("[Logs] Failed to write NOT REGISTERED Logs row:", e)
 
-        gate_state = {"vehicleFound": vehicle_count > 0, "plate": None, "driver": None, "vehicle": None, "lastUpdate": now_ms}
+        gate_state = {
+            "vehicleFound": vehicle_count > 0,
+            "plate": None,
+            "driver": None,
+            "vehicle": None,
+            "lastUpdate": now_ms,
+        }
         try:
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B4 no rows):", e)
         return gate_state
 
-    # =========================================================
-    # REGISTERED
-    # =========================================================
     vehicle_details = rows[0]
 
     raw_driver = vehicle_details.get("Driver")
@@ -791,17 +815,17 @@ async def update_gate_state_and_push(
         if registered_plate and await should_insert_log(registered_plate):
             await insert_log_row(
                 plate_number=registered_plate,
-                driver_json=raw_driver,          # registered: always include details (when inserting)
+                driver_json=raw_driver,
                 vehicle_json=vehicle_json,
-                role_type=(raw_driver or {}).get("RoleType") if isinstance(raw_driver, dict) and (raw_driver or {}).get("RoleType") else None,
+                role_type=(raw_driver or {}).get("RoleType") if isinstance(raw_driver, dict) else None,
                 verification="REGISTERED",
                 camera_source=camera_source,
                 image_preview=image_preview,
                 ai_confidence=ai_conf_bigint,
             )
-            print(f'[Logs] REGISTERED log inserted for {registered_plate}')
+            print(f"[Logs] REGISTERED log inserted for {registered_plate}")
         else:
-            print(f'[Logs] REGISTERED log skipped (<5min) for {registered_plate}')
+            print(f"[Logs] REGISTERED log skipped (<5min) for {registered_plate}")
     except Exception as e:
         print("[Logs] Failed to write REGISTERED Logs row:", e)
 
@@ -828,7 +852,6 @@ async def update_gate_state_and_push(
 # =========================================================
 # ROUTES
 # =========================================================
-
 @app.get("/health")
 async def health():
     return {
@@ -844,12 +867,12 @@ async def health():
 
 @app.get("/alpr/models")
 async def alpr_models():
-    return {"detector_models": DETECTOR_MODELS, "ocr_models": OCR_MODELS}
+    return {
+        "detector_models": DETECTOR_MODELS,
+        "ocr_models": OCR_MODELS,
+    }
 
 
-# ---------------------------------------------------------
-# /stream-frame (mobile → server frame upload)
-# ---------------------------------------------------------
 @app.post("/stream-frame")
 async def stream_frame(
     frame: UploadFile = File(...),
@@ -866,7 +889,11 @@ async def stream_frame(
     ct = frame.content_type or "image/jpeg"
     ts = int(time.time() * 1000)
 
-    latest_frames[sid] = {"buffer": data, "mimetype": ct, "ts": ts}
+    latest_frames[sid] = {
+        "buffer": data,
+        "mimetype": ct,
+        "ts": ts,
+    }
 
     try:
         pusher_client.trigger("video-channel", "frame", {"stream_id": sid, "ts": ts})
@@ -876,9 +903,6 @@ async def stream_frame(
     return JSONResponse({"success": True})
 
 
-# ---------------------------------------------------------
-# /latest-frame (web → server)
-# ---------------------------------------------------------
 @app.get("/latest-frame")
 async def get_latest_frame(stream_id: str = Query("mobile-1")):
     frame = latest_frames.get(stream_id)
@@ -892,14 +916,11 @@ async def get_latest_frame(stream_id: str = Query("mobile-1")):
     return Response(content=buffer, media_type=mimetype, headers=headers)
 
 
-# ---------------------------------------------------------
-# /detect (ALPR + YOLO)
-# ---------------------------------------------------------
 @app.post("/detect")
 async def detect_all(
     file: UploadFile = File(...),
-    detector_model: Optional[DetectorName] = None,
-    ocr_model: Optional[OcrName] = None,
+    detector_model: Optional[DetectorName] = Form(None),
+    ocr_model: Optional[OcrName] = Form(None),
     stream_id: Optional[str] = Form(None),
 ):
     if not file.content_type or not file.content_type.startswith("image/"):
@@ -918,6 +939,7 @@ async def detect_all(
     sid = stream_id or "mobile-1"
 
     t0 = time.time()
+
     vehicles = run_yolo_vehicles(img_np)
     alpr_result = run_alpr(img_np, detector_name, ocr_name)
     plates = alpr_result["plates"]
@@ -934,7 +956,7 @@ async def detect_all(
             "success": True,
             "image_width": w,
             "image_height": h,
-            "vehicles": [v.dict() for v in vehicles],
+            "vehicles": [v.model_dump() for v in vehicles],
             "plates": plates,
             "alpr_model": alpr_result["model"],
             "yolo_model": YOLO_MODEL_PATH,
@@ -944,3 +966,10 @@ async def detect_all(
             "stream_id": sid,
         }
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

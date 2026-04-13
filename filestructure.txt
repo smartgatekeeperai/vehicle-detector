@@ -1,5 +1,6 @@
 |-- .env
 |-- .gitignore
+|-- dbo.sql
 |-- howtorunlocal.txt
 |-- LICENSE
 |-- main.py

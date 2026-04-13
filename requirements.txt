@@ -1,5 +1,5 @@
 # --- Web API stack ---
-fastapi==0.115.4
+fastapi==0.112.4
 uvicorn[standard]==0.32.0
 python-multipart==0.0.9
 pydantic==2.9.2
@@ -12,7 +12,7 @@ numpy==1.26.4
 # --- YOLOv8 / Ultralytics ---
 ultralytics==8.3.27
 
-# --- PyTorch CPU (Windows, Python 3.10) ---
+# --- PyTorch CPU ---
 torch==2.4.1
 torchvision==0.19.1
 
@@ -31,4 +31,5 @@ pusher==3.3.2
 # --- Env loader ---
 python-dotenv==1.0.1
 
-pyserial==3.5.0
+# --- Serial ---
+pyserial==3.5
