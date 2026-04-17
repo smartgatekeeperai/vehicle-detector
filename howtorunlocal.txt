@@ -1,4 +1,6 @@
-c:\Development\smartgatekeeperai\vehicle-detector\venv\Scripts\activate.bat  
+python -m venv venv
+
+venv\Scripts\activate
 
 pip install -r requirements.txt
 

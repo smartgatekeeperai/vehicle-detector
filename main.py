@@ -1,8 +1,8 @@
-# main.py
 import io
 import os
 import time
 import json
+import socket
 import tempfile
 import traceback
 from functools import lru_cache
@@ -47,7 +47,6 @@ except Exception:
 # =========================================================
 # CONFIG
 # =========================================================
-
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8x.pt")
 
 # COCO vehicle class IDs
@@ -80,6 +79,10 @@ LOG_WINDOW_MS = int(os.getenv("LOG_WINDOW_MS", str(5 * 60 * 1000)))
 # Used for ImagePreview in Logs
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 
+# Stream registry timing
+STREAM_ONLINE_WINDOW_MS = int(os.getenv("STREAM_ONLINE_WINDOW_MS", "5000"))
+STREAM_STALE_REMOVE_MS = int(os.getenv("STREAM_STALE_REMOVE_MS", "60000"))
+
 
 # =========================================================
 # SERIAL CONFIG (PICO CONTROL)
@@ -97,14 +100,12 @@ SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))
 DETECTOR_MODELS: List[PlateDetectorModel] = list(get_args(PlateDetectorModel))
 OCR_MODELS: List[OcrModel] = list(get_args(OcrModel))
 
-# Prefer newer v2 OCR models first
 if "cct-xs-v2-global-model" in OCR_MODELS:
     OCR_MODELS.remove("cct-xs-v2-global-model")
     OCR_MODELS.insert(0, "cct-xs-v2-global-model")
 elif "cct-s-v2-global-model" in OCR_MODELS:
     OCR_MODELS.remove("cct-s-v2-global-model")
     OCR_MODELS.insert(0, "cct-s-v2-global-model")
-
 
 DetectorName = Literal[tuple(DETECTOR_MODELS)]  # type: ignore
 OcrName = Literal[tuple(OCR_MODELS)]  # type: ignore
@@ -123,7 +124,7 @@ def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
 # APP
 # =========================================================
 app = FastAPI(
-    title="Smart Gate Keeper - YOLOv8x + FastALPR",
+    title="Smart Gate Keeper - YOLOv8 + FastALPR",
     version="1.0.0",
 )
 
@@ -161,9 +162,68 @@ current_registered_ts: int = 0
 
 
 # =========================================================
-# LATEST FRAMES
+# LATEST FRAMES + ACTIVE STREAMS
 # =========================================================
 latest_frames: Dict[str, Dict[str, Any]] = {}
+active_streams: Dict[str, Dict[str, Any]] = {}
+
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def touch_stream(stream_id: str, ts: Optional[int] = None) -> Dict[str, Any]:
+    sid = (stream_id or "").strip() or "mobile-1"
+    ts_ms = ts if ts is not None else now_ms()
+
+    existing = active_streams.get(sid) or {}
+    record = {
+        "stream_id": sid,
+        "last_seen": ts_ms,
+        "first_seen": existing.get("first_seen", ts_ms),
+    }
+    active_streams[sid] = record
+    return record
+
+
+def cleanup_streams(current_ts: Optional[int] = None) -> None:
+    ts_ms = current_ts if current_ts is not None else now_ms()
+
+    stale_stream_ids = [
+        sid
+        for sid, info in active_streams.items()
+        if (ts_ms - int(info.get("last_seen", 0))) > STREAM_STALE_REMOVE_MS
+    ]
+    for sid in stale_stream_ids:
+        active_streams.pop(sid, None)
+
+    stale_frame_ids = [
+        sid
+        for sid, info in latest_frames.items()
+        if (ts_ms - int(info.get("ts", 0))) > STREAM_STALE_REMOVE_MS
+    ]
+    for sid in stale_frame_ids:
+        latest_frames.pop(sid, None)
+
+
+def build_stream_list(current_ts: Optional[int] = None) -> List[Dict[str, Any]]:
+    ts_ms = current_ts if current_ts is not None else now_ms()
+    cleanup_streams(ts_ms)
+
+    items: List[Dict[str, Any]] = []
+    for sid, info in active_streams.items():
+        last_seen = int(info.get("last_seen", 0))
+        items.append(
+            {
+                "stream_id": sid,
+                "last_seen": last_seen,
+                "is_online": (ts_ms - last_seen) <= STREAM_ONLINE_WINDOW_MS,
+                "has_frame": sid in latest_frames,
+            }
+        )
+
+    items.sort(key=lambda x: x["last_seen"], reverse=True)
+    return items
 
 
 # =========================================================
@@ -194,6 +254,7 @@ else:
 async def startup():
     if not DATABASE_URL:
         print("[WARN] DATABASE_URL is not set; DB queries will fail.")
+        app.state.db_pool = None
         return
 
     try:
@@ -231,23 +292,105 @@ async def db_execute(sql: str, params: Optional[List[Any]] = None) -> None:
         await conn.execute(sql, *params)
 
 
+async def get_light_by_stream_id(stream_id: str) -> Optional[Dict[str, Any]]:
+    if not stream_id:
+        return None
+
+    sql = """
+        SELECT
+            "Name",
+            "SecretKey",
+            "CameraStreamId"
+        FROM dbo."Lights"
+        WHERE "Active" = true
+          AND "CameraStreamId" = $1
+        LIMIT 1
+    """
+    rows = await db_query(sql, [stream_id])
+    if not rows:
+        return None
+
+    return rows[0]
+
+
 # =========================================================
 # PUSHER CLIENT
 # =========================================================
-PUSHER_APP_ID = os.getenv("PUSHER_APP_ID")
-PUSHER_KEY = os.getenv("PUSHER_KEY", "")
-PUSHER_SECRET = os.getenv("PUSHER_SECRET", "")
-PUSHER_CLUSTER = os.getenv("PUSHER_CLUSTER", "ap1")
-PUSHER_HOST = os.getenv("PUSHER_HOST")
-PUSHER_PORT = os.getenv("PUSHER_PORT")
-USE_LOCAL_PUSHER = os.getenv("USE_LOCAL_PUSHER", "false").lower() == "true"
+PUSHER_APP_ID = (os.getenv("PUSHER_APP_ID") or "").strip()
+PUSHER_KEY = (os.getenv("PUSHER_KEY") or "").strip()
+PUSHER_SECRET = (os.getenv("PUSHER_SECRET") or "").strip()
+PUSHER_CLUSTER = (os.getenv("PUSHER_CLUSTER") or "ap1").strip()
+PUSHER_HOST = (os.getenv("PUSHER_HOST") or "").strip()
+PUSHER_PORT = int((os.getenv("PUSHER_PORT") or "6001").strip())
 
-# Hugging Face is not local
-is_local_env = (
-    os.getenv("SPACE_ID") is None
-    and os.getenv("VERCEL") != "1"
-    and os.getenv("NODE_ENV") != "production"
-)
+USE_LOCAL_PUSHER = (os.getenv("USE_LOCAL_PUSHER") or "false").strip().lower() == "true"
+PUSHER_RETRY_SECONDS = int((os.getenv("PUSHER_RETRY_SECONDS") or "10").strip())
+PUSHER_CONNECT_TIMEOUT = float((os.getenv("PUSHER_CONNECT_TIMEOUT") or "0.8").strip())
+
+IS_HUGGING_FACE = bool(os.getenv("SPACE_ID"))
+IS_VERCEL = os.getenv("VERCEL") == "1"
+IS_PRODUCTION = (os.getenv("NODE_ENV") or "").strip().lower() == "production"
+
+USE_LOCAL_PUSHER_EFFECTIVE = USE_LOCAL_PUSHER and not IS_HUGGING_FACE and not IS_VERCEL and not IS_PRODUCTION
+
+
+def can_connect_socket(host: str, port: int, timeout: float = 0.8) -> bool:
+    if not host or not port:
+        return False
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+class DummyPusher:
+    def __init__(self, reason: str = "disabled"):
+        self.reason = reason
+        self.last_error = None
+        self.disabled_until = 0.0
+
+    def trigger(self, channel, event, data):
+        return None
+
+
+class SafePusher:
+    def __init__(self, client, mode: str, retry_seconds: int = 10):
+        self.client = client
+        self.mode = mode
+        self.retry_seconds = max(1, retry_seconds)
+        self.disabled_until = 0.0
+        self.last_error = None
+
+    def trigger(self, channel, event, data):
+        now = time.time()
+
+        if now < self.disabled_until:
+            return None
+
+        try:
+            return self.client.trigger(channel, event, data)
+        except Exception as e:
+            self.last_error = str(e)
+            self.disabled_until = now + self.retry_seconds
+            print(
+                f"[Pusher] trigger failed in {self.mode} mode; "
+                f"muted for {self.retry_seconds}s. Error: {e}"
+            )
+            return None
+
+
+pusher_mode = "dummy"
+pusher_reason = ""
+pusher_client: Any = DummyPusher("uninitialized")
 
 print(
     "[Pusher] env values:",
@@ -258,37 +401,81 @@ print(
     "HOST=", repr(PUSHER_HOST),
     "PORT=", repr(PUSHER_PORT),
     "USE_LOCAL_PUSHER=", USE_LOCAL_PUSHER,
-    "is_local_env=", is_local_env,
+    "USE_LOCAL_PUSHER_EFFECTIVE=", USE_LOCAL_PUSHER_EFFECTIVE,
+    "IS_HUGGING_FACE=", IS_HUGGING_FACE,
+    "IS_VERCEL=", IS_VERCEL,
+    "IS_PRODUCTION=", IS_PRODUCTION,
 )
 
-if not PUSHER_APP_ID or PUSHER_APP_ID.strip() == "":
-    print("[WARN] PUSHER_APP_ID is not set or invalid. Using DummyPusher.")
+if not PUSHER_APP_ID:
+    pusher_mode = "dummy"
+    pusher_reason = "missing PUSHER_APP_ID"
+    print(f"[Pusher] Dummy mode: {pusher_reason}")
+    pusher_client = DummyPusher(pusher_reason)
 
-    class DummyPusher:
-        def trigger(self, channel, event, data):
-            print(f"[DummyPusher] trigger → channel={channel}, event={event}, data={data}")
-
-    pusher_client: Any = DummyPusher()
 else:
-    client_kwargs: Dict[str, Any] = {
-        "app_id": PUSHER_APP_ID,
-        "key": PUSHER_KEY,
-        "secret": PUSHER_SECRET,
-        "cluster": PUSHER_CLUSTER,
-        "ssl": True,
-    }
+    if USE_LOCAL_PUSHER_EFFECTIVE and PUSHER_HOST:
+        local_reachable = can_connect_socket(
+            PUSHER_HOST,
+            PUSHER_PORT,
+            timeout=PUSHER_CONNECT_TIMEOUT,
+        )
 
-    if is_local_env and USE_LOCAL_PUSHER and PUSHER_HOST:
-        host = PUSHER_HOST
-        port = int(PUSHER_PORT or "6001")
-        print(f"[Pusher] Using LOCAL server at {host}:{port}")
-        client_kwargs.pop("cluster", None)
-        client_kwargs.update({"host": host, "port": port, "ssl": False})
+        if local_reachable:
+            try:
+                local_kwargs: Dict[str, Any] = {
+                    "app_id": PUSHER_APP_ID,
+                    "key": PUSHER_KEY,
+                    "secret": PUSHER_SECRET,
+                    "host": PUSHER_HOST,
+                    "port": PUSHER_PORT,
+                    "ssl": False,
+                }
+                raw_local_client = Pusher(**local_kwargs)
+                pusher_client = SafePusher(
+                    raw_local_client,
+                    mode="local",
+                    retry_seconds=PUSHER_RETRY_SECONDS,
+                )
+                pusher_mode = "local"
+                pusher_reason = f"connected to local server at {PUSHER_HOST}:{PUSHER_PORT}"
+                print(f"[Pusher] Using LOCAL server at {PUSHER_HOST}:{PUSHER_PORT}")
+            except Exception as e:
+                pusher_mode = "dummy"
+                pusher_reason = f"local init failed: {e}"
+                pusher_client = DummyPusher(pusher_reason)
+                print(f"[Pusher] Dummy mode: {pusher_reason}")
+        else:
+            pusher_mode = "dummy"
+            pusher_reason = f"local server not reachable at {PUSHER_HOST}:{PUSHER_PORT}"
+            pusher_client = DummyPusher(pusher_reason)
+            print(f"[Pusher] Dummy mode: {pusher_reason}")
+
     else:
-        print(f"[Pusher] Using CLOUD (cluster={PUSHER_CLUSTER}, TLS=True)")
+        try:
+            cloud_kwargs: Dict[str, Any] = {
+                "app_id": PUSHER_APP_ID,
+                "key": PUSHER_KEY,
+                "secret": PUSHER_SECRET,
+                "cluster": PUSHER_CLUSTER,
+                "ssl": True,
+            }
+            raw_cloud_client = Pusher(**cloud_kwargs)
+            pusher_client = SafePusher(
+                raw_cloud_client,
+                mode="cloud",
+                retry_seconds=PUSHER_RETRY_SECONDS,
+            )
+            pusher_mode = "cloud"
+            pusher_reason = f"using cloud cluster={PUSHER_CLUSTER}"
+            print(f"[Pusher] Using CLOUD (cluster={PUSHER_CLUSTER}, TLS=True)")
+        except Exception as e:
+            pusher_mode = "dummy"
+            pusher_reason = f"cloud init failed: {e}"
+            pusher_client = DummyPusher(pusher_reason)
+            print(f"[Pusher] Dummy mode: {pusher_reason}")
 
-    pusher_client = Pusher(**client_kwargs)
-    print("[INIT] Pusher client initialized")
+print(f"[INIT] Realtime mode = {pusher_mode} ({pusher_reason})")
 
 
 # =========================================================
@@ -427,6 +614,7 @@ def serialize_alpr_result(result) -> dict:
             conf_val = float(sum(raw_conf) / len(raw_conf)) if raw_conf else 0.0
         else:
             conf_val = float(raw_conf or 0.0)
+
         ocr = {
             "text": getattr(ocr_obj, "text", None),
             "confidence": conf_val,
@@ -459,8 +647,6 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str) -> dict:
             temp_path = tmp.name
 
         Image.fromarray(img_np).save(temp_path, format="JPEG")
-
-        # Hugging Face-safe path input for FastALPR
         results = alpr.predict(temp_path)
 
     except Exception as e:
@@ -492,6 +678,7 @@ def normalize_plate_text(plates: List[dict]) -> List[str]:
         text = ocr.get("text")
         if not text:
             continue
+
         normalized = (
             text.replace(" ", "")
             .replace("-", "")
@@ -554,36 +741,51 @@ def is_gate_verified_open(gate: Dict[str, Any]) -> bool:
     )
 
 
-def get_pico_command_from_gate(gate: Dict[str, Any]) -> str:
+def get_light_command_from_gate(gate: Dict[str, Any]) -> str:
     if is_gate_verified_open(gate):
         return "green"
     return "red"
 
 
-def send_serial_command_to_pico(command: str) -> None:
+def build_light_serial_command(light: Dict[str, Any], command: str) -> Optional[str]:
+    if not light:
+        return None
+
+    name = str(light.get("Name") or "").strip()
+    secret = str(light.get("SecretKey") or "").strip()
+    cmd = str(command or "").strip().lower()
+
+    if not name or not secret or not cmd:
+        return None
+
+    return f"{name} {secret} {cmd}"
+
+
+def send_serial_command_to_pico(command_line: str) -> None:
     global last_serial_command
 
     if not SERIAL_ENABLED:
-        print(f"[SERIAL] Skipped (disabled): {command}")
+        print(f"[SERIAL] Skipped (disabled): {command_line}")
         return
 
     if serial is None:
         print("[SERIAL] pyserial is not installed.")
         return
 
-    command = (command or "").strip().lower()
-    if not command:
+    command_line = (command_line or "").strip()
+    if not command_line:
+        print("[SERIAL] Empty command line")
         return
 
     try:
         with serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT) as ser:
             time.sleep(SERIAL_OPEN_DELAY)
-            ser.write((command + "\n").encode("utf-8"))
+            ser.write((command_line + "\n").encode("utf-8"))
             ser.flush()
-            last_serial_command = command
-            print(f"[SERIAL] Sent to Pico: {command}")
+            last_serial_command = command_line
+            print(f"[SERIAL] Sent to Pico: {command_line}")
     except Exception as e:
-        print(f"[SERIAL] Failed to send '{command}' to Pico: {e}")
+        print(f"[SERIAL] Failed to send '{command_line}' to Pico: {e}")
 
 
 # =========================================================
@@ -601,10 +803,11 @@ async def get_last_log_time_ms_for_plate(plate_text: str) -> Optional[int]:
         rows = await db_query(sql, [plate_text])
         if not rows:
             return None
+
         ts_ms = rows[0].get("ts_ms")
         return int(ts_ms) if ts_ms is not None else None
     except Exception as e:
-        print('[Logs] Warning: get_last_log_time_ms_for_plate failed:', e)
+        print("[Logs] Warning: get_last_log_time_ms_for_plate failed:", e)
         return None
 
 
@@ -646,19 +849,25 @@ async def update_gate_state_and_push(
 ) -> Dict[str, Any]:
     global gate_state, current_registered_gate_state, current_registered_ts
 
-    now_ms = int(time.time() * 1000)
+    now_ts = now_ms()
     vehicle_count = len(vehicles)
 
+    print(
+        f"[GateState] update start | stream={camera_source} "
+        f"| vehicles={vehicle_count} | plates={len(plates)}"
+    )
+
     if current_registered_gate_state is not None:
-        lock_age = now_ms - current_registered_ts
+        lock_age = now_ts - current_registered_ts
 
         if vehicle_count > 0 and lock_age <= PASS_LOCK_MS:
             gate_state = {
                 **current_registered_gate_state,
                 "vehicleFound": True,
-                "lastUpdate": now_ms,
+                "lastUpdate": now_ts,
             }
             try:
+                print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
                 pusher_client.trigger("gate-channel", "gate-update", gate_state)
             except Exception as e:
                 print("[Pusher] Error (lock, vehicle present):", e)
@@ -666,8 +875,9 @@ async def update_gate_state_and_push(
 
         if vehicle_count == 0:
             last_update = gate_state.get("lastUpdate") or current_registered_ts
-            if now_ms - last_update <= CLEAR_AFTER_MS:
+            if now_ts - last_update <= CLEAR_AFTER_MS:
                 try:
+                    print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
                     pusher_client.trigger("gate-channel", "gate-update", gate_state)
                 except Exception as e:
                     print("[Pusher] Error (lock, smooth clear window):", e)
@@ -678,8 +888,9 @@ async def update_gate_state_and_push(
 
     if (not vehicles) and (not plates):
         last_update = gate_state.get("lastUpdate")
-        if gate_state.get("vehicleFound") and last_update and (now_ms - last_update <= CLEAR_AFTER_MS):
+        if gate_state.get("vehicleFound") and last_update and (now_ts - last_update <= CLEAR_AFTER_MS):
             try:
+                print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
                 pusher_client.trigger("gate-channel", "gate-update", gate_state)
             except Exception as e:
                 print("[Pusher] Error (B1 smooth no-vehicle window):", e)
@@ -693,6 +904,7 @@ async def update_gate_state_and_push(
             "lastUpdate": None,
         }
         try:
+            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B1 reset):", e)
@@ -704,9 +916,10 @@ async def update_gate_state_and_push(
             "plate": gate_state.get("plate"),
             "driver": gate_state.get("driver"),
             "vehicle": gate_state.get("vehicle"),
-            "lastUpdate": now_ms,
+            "lastUpdate": now_ts,
         }
         try:
+            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B2 vehicles only):", e)
@@ -723,9 +936,10 @@ async def update_gate_state_and_push(
             "plate": gate_state.get("plate"),
             "driver": gate_state.get("driver"),
             "vehicle": gate_state.get("vehicle"),
-            "lastUpdate": now_ms,
+            "lastUpdate": now_ts,
         }
         try:
+            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B3 no cleaned plates):", e)
@@ -749,9 +963,10 @@ async def update_gate_state_and_push(
             "plate": gate_state.get("plate"),
             "driver": gate_state.get("driver"),
             "vehicle": gate_state.get("vehicle"),
-            "lastUpdate": now_ms,
+            "lastUpdate": now_ts,
         }
         try:
+            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B4 DB error):", e)
@@ -760,7 +975,7 @@ async def update_gate_state_and_push(
     async def should_insert_log(plate_number: str) -> bool:
         try:
             last_ts_ms = await get_last_log_time_ms_for_plate(plate_number)
-            if last_ts_ms is not None and (now_ms - last_ts_ms) <= LOG_WINDOW_MS:
+            if last_ts_ms is not None and (now_ts - last_ts_ms) <= LOG_WINDOW_MS:
                 return False
             return True
         except Exception as e:
@@ -792,9 +1007,10 @@ async def update_gate_state_and_push(
             "plate": None,
             "driver": None,
             "vehicle": None,
-            "lastUpdate": now_ms,
+            "lastUpdate": now_ts,
         }
         try:
+            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
             pusher_client.trigger("gate-channel", "gate-update", gate_state)
         except Exception as e:
             print("[Pusher] Error (B4 no rows):", e)
@@ -839,14 +1055,16 @@ async def update_gate_state_and_push(
         "plate": registered_plate,
         "driver": raw_driver,
         "vehicle": vehicle_json,
-        "lastUpdate": now_ms,
+        "lastUpdate": now_ts,
     }
 
     gate_state = new_state
     current_registered_gate_state = new_state
-    current_registered_ts = now_ms
+    current_registered_ts = now_ts
 
     try:
+        print(f"[GateState] registered match -> {json.dumps(gate_state, default=str)}")
+        print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
         pusher_client.trigger("gate-channel", "gate-update", gate_state)
     except Exception as e:
         print("[Pusher] Error (registered trigger):", e)
@@ -859,6 +1077,9 @@ async def update_gate_state_and_push(
 # =========================================================
 @app.get("/health")
 async def health():
+    safe_last_error = getattr(pusher_client, "last_error", None)
+    safe_disabled_until = getattr(pusher_client, "disabled_until", 0.0)
+
     return {
         "status": "ok",
         "device": DEVICE,
@@ -867,6 +1088,19 @@ async def health():
         "public_base_url": PUBLIC_BASE_URL or None,
         "serial_enabled": SERIAL_ENABLED,
         "serial_port": SERIAL_PORT if SERIAL_ENABLED else None,
+        "stream_online_window_ms": STREAM_ONLINE_WINDOW_MS,
+        "stream_stale_remove_ms": STREAM_STALE_REMOVE_MS,
+        "realtime": {
+            "mode": pusher_mode,
+            "reason": pusher_reason,
+            "use_local_requested": USE_LOCAL_PUSHER,
+            "use_local_effective": USE_LOCAL_PUSHER_EFFECTIVE,
+            "host": PUSHER_HOST or None,
+            "port": PUSHER_PORT,
+            "cluster": PUSHER_CLUSTER,
+            "last_error": safe_last_error,
+            "muted_until_epoch": safe_disabled_until if safe_disabled_until else None,
+        },
     }
 
 
@@ -875,6 +1109,15 @@ async def alpr_models():
     return {
         "detector_models": DETECTOR_MODELS,
         "ocr_models": OCR_MODELS,
+    }
+
+
+@app.get("/streams")
+async def get_streams():
+    ts = now_ms()
+    return {
+        "success": True,
+        "streams": build_stream_list(ts),
     }
 
 
@@ -890,27 +1133,30 @@ async def stream_frame(
     if not data:
         raise HTTPException(status_code=400, detail="Empty frame")
 
-    sid = stream_id or "mobile-1"
+    sid = (stream_id or "").strip() or "mobile-1"
     ct = frame.content_type or "image/jpeg"
-    ts = int(time.time() * 1000)
+    ts = now_ms()
 
     latest_frames[sid] = {
         "buffer": data,
         "mimetype": ct,
         "ts": ts,
     }
+    touch_stream(sid, ts)
+    cleanup_streams(ts)
 
     try:
         pusher_client.trigger("video-channel", "frame", {"stream_id": sid, "ts": ts})
     except Exception as e:
         print("[/stream-frame] Pusher error:", e)
 
-    return JSONResponse({"success": True})
+    return JSONResponse({"success": True, "stream_id": sid, "ts": ts})
 
 
 @app.get("/latest-frame")
 async def get_latest_frame(stream_id: str = Query("mobile-1")):
-    frame = latest_frames.get(stream_id)
+    sid = (stream_id or "").strip() or "mobile-1"
+    frame = latest_frames.get(sid)
     if not frame:
         raise HTTPException(status_code=404, detail="No frame yet")
 
@@ -919,6 +1165,25 @@ async def get_latest_frame(stream_id: str = Query("mobile-1")):
 
     headers = {"Cache-Control": "no-store"}
     return Response(content=buffer, media_type=mimetype, headers=headers)
+
+
+@app.post("/test-pusher")
+async def test_pusher():
+    payload = {
+        "vehicleFound": True,
+        "plate": "TEST-123",
+        "driver": {"fullName": "Test Driver"},
+        "vehicle": {"type": "Sedan", "brand": "Toyota", "model": "Vios"},
+        "lastUpdate": int(time.time() * 1000),
+    }
+    print("[/test-pusher] sending gate-update:", payload)
+    pusher_client.trigger("gate-channel", "gate-update", payload)
+    return {
+        "success": True,
+        "mode": pusher_mode,
+        "reason": pusher_reason,
+        "payload": payload,
+    }
 
 
 @app.post("/detect")
@@ -940,8 +1205,11 @@ async def detect_all(
 
     img_np = load_image_to_numpy(data)
     h, w = img_np.shape[:2]
+    sid = (stream_id or "").strip() or "mobile-1"
+    ts = now_ms()
 
-    sid = stream_id or "mobile-1"
+    touch_stream(sid, ts)
+    cleanup_streams(ts)
 
     t0 = time.time()
 
@@ -949,10 +1217,31 @@ async def detect_all(
     alpr_result = run_alpr(img_np, detector_name, ocr_name)
     plates = alpr_result["plates"]
 
+    print(f"[/detect] stream_id={sid}")
+    print(f"[/detect] vehicles_count={len(vehicles)}")
+    print(f"[/detect] plates_count={len(plates)}")
+    if vehicles:
+        print(f"[/detect] top_vehicle={vehicles[0].class_name} conf={vehicles[0].confidence:.4f}")
+    if plates:
+        print(f"[/detect] top_plate={plates[0]}")
+
     gate = await update_gate_state_and_push(vehicles, plates, camera_source=sid)
 
-    pico_command = get_pico_command_from_gate(gate)
-    send_serial_command_to_pico(pico_command)
+    print(f"[/detect] gate_state={json.dumps(gate, default=str)}")
+
+    light = await get_light_by_stream_id(sid)
+    print(f"[/detect] light_mapping={json.dumps(light, default=str) if light else None}")
+
+    light_command = get_light_command_from_gate(gate)
+    serial_command = build_light_serial_command(light, light_command)
+
+    print(f"[/detect] light_command={light_command}")
+    print(f"[/detect] serial_command={serial_command}")
+
+    if serial_command:
+        send_serial_command_to_pico(serial_command)
+    else:
+        print(f"[/detect] No active light mapping found for stream_id='{sid}', skipping serial send.")
 
     t1 = time.time()
 
@@ -967,7 +1256,9 @@ async def detect_all(
             "yolo_model": YOLO_MODEL_PATH,
             "total_time_ms": (t1 - t0) * 1000.0,
             "gate_state": gate,
-            "pico_command": pico_command,
+            "light": light,
+            "light_command": light_command,
+            "serial_command": serial_command,
             "stream_id": sid,
         }
     )
