@@ -5,6 +5,7 @@ import json
 import socket
 import tempfile
 import traceback
+import threading
 from functools import lru_cache
 from typing import List, Optional, Literal, get_args, Any, Dict, Tuple
 
@@ -93,6 +94,10 @@ SERIAL_BAUDRATE = int(os.getenv("SERIAL_BAUDRATE", "115200"))
 SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "1"))
 SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))
 
+last_serial_command: Optional[str] = None
+_serial_lock = threading.Lock()
+_serial_conn = None
+
 
 # =========================================================
 # FASTALPR CONFIG (PLATES)
@@ -125,7 +130,7 @@ def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
 # =========================================================
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8 + FastALPR",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -237,7 +242,6 @@ def cleanup_streams(current_ts: Optional[int] = None) -> None:
     for sid in stale_frame_ids:
         latest_frames.pop(sid, None)
 
-    # Optional cleanup of very old per-stream state
     stale_state_ids = [
         sid
         for sid, state in gate_states_by_stream.items()
@@ -300,14 +304,22 @@ async def startup():
     if not DATABASE_URL:
         print("[WARN] DATABASE_URL is not set; DB queries will fail.")
         app.state.db_pool = None
-        return
+    else:
+        try:
+            app.state.db_pool = await asyncpg.create_pool(DATABASE_URL)
+            print("[INIT] asyncpg pool created")
+        except Exception as e:
+            print("[DB] Failed to create pool:", e)
+            app.state.db_pool = None
 
-    try:
-        app.state.db_pool = await asyncpg.create_pool(DATABASE_URL)
-        print("[INIT] asyncpg pool created")
-    except Exception as e:
-        print("[DB] Failed to create pool:", e)
-        app.state.db_pool = None
+    # Pre-open serial once on startup if enabled
+    if SERIAL_ENABLED:
+        try:
+            ser = get_serial_connection()
+            if ser is not None:
+                print(f"[SERIAL] Ready on {SERIAL_PORT}")
+        except Exception as e:
+            print("[SERIAL] Startup open failed:", e)
 
 
 @app.on_event("shutdown")
@@ -316,6 +328,9 @@ async def shutdown():
     if pool is not None:
         await pool.close()
         print("[DB] Pool closed")
+
+    close_serial_connection()
+    print("[SERIAL] Port closed")
 
 
 async def db_query(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
@@ -776,9 +791,98 @@ def build_image_preview_url(stream_id: str) -> str:
 # =========================================================
 # SERIAL HELPERS
 # =========================================================
-last_serial_command: Optional[str] = None
+def close_serial_connection() -> None:
+    global _serial_conn
+    with _serial_lock:
+        try:
+            if _serial_conn is not None and _serial_conn.is_open:
+                _serial_conn.close()
+        except Exception:
+            pass
+        _serial_conn = None
 
 
+def get_serial_connection():
+    global _serial_conn
+
+    if not SERIAL_ENABLED:
+        return None
+
+    if serial is None:
+        print("[SERIAL] pyserial is not installed.")
+        return None
+
+    try:
+        if _serial_conn is not None and _serial_conn.is_open:
+            return _serial_conn
+    except Exception:
+        _serial_conn = None
+
+    try:
+        print(f"[SERIAL] Opening port {SERIAL_PORT} ...")
+        _serial_conn = serial.Serial(
+            SERIAL_PORT,
+            SERIAL_BAUDRATE,
+            timeout=SERIAL_TIMEOUT,
+            write_timeout=SERIAL_TIMEOUT,
+        )
+
+        # Give MicroPython/USB serial a moment only when opening
+        time.sleep(SERIAL_OPEN_DELAY)
+
+        try:
+            _serial_conn.reset_input_buffer()
+        except Exception:
+            pass
+
+        try:
+            _serial_conn.reset_output_buffer()
+        except Exception:
+            pass
+
+        print(f"[SERIAL] Port opened: {SERIAL_PORT}")
+        return _serial_conn
+
+    except Exception as e:
+        print(f"[SERIAL] Failed to open port {SERIAL_PORT}: {e}")
+        _serial_conn = None
+        return None
+
+
+def send_serial_command_to_pico(command_line: str) -> bool:
+    global last_serial_command
+
+    if not SERIAL_ENABLED:
+        print(f"[SERIAL] Skipped (disabled): {command_line}")
+        return False
+
+    command_line = (command_line or "").strip()
+    if not command_line:
+        print("[SERIAL] Empty command line")
+        return False
+
+    with _serial_lock:
+        ser = get_serial_connection()
+        if ser is None:
+            return False
+
+        try:
+            payload = (command_line + "\n").encode("utf-8")
+            ser.write(payload)
+            ser.flush()
+            last_serial_command = command_line
+            print(f"[SERIAL] Sent to Pico: {command_line}")
+            return True
+
+        except Exception as e:
+            print(f"[SERIAL] Failed to send '{command_line}' to Pico: {e}")
+            close_serial_connection()
+            return False
+
+
+# =========================================================
+# LIGHT COMMAND HELPERS
+# =========================================================
 def is_gate_verified_open(gate: Dict[str, Any]) -> bool:
     return bool(
         gate.get("vehicleFound") is True
@@ -804,33 +908,6 @@ def build_light_serial_command(light: Dict[str, Any], command: str) -> Optional[
         return None
 
     return f"{name} {secret} {cmd}"
-
-
-def send_serial_command_to_pico(command_line: str) -> None:
-    global last_serial_command
-
-    if not SERIAL_ENABLED:
-        print(f"[SERIAL] Skipped (disabled): {command_line}")
-        return
-
-    if serial is None:
-        print("[SERIAL] pyserial is not installed.")
-        return
-
-    command_line = (command_line or "").strip()
-    if not command_line:
-        print("[SERIAL] Empty command line")
-        return
-
-    try:
-        with serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT) as ser:
-            time.sleep(SERIAL_OPEN_DELAY)
-            ser.write((command_line + "\n").encode("utf-8"))
-            ser.flush()
-            last_serial_command = command_line
-            print(f"[SERIAL] Sent to Pico: {command_line}")
-    except Exception as e:
-        print(f"[SERIAL] Failed to send '{command_line}' to Pico: {e}")
 
 
 # =========================================================
@@ -917,9 +994,6 @@ async def update_gate_state_and_push(
         f"| vehicles={vehicle_count} | plates={len(plates)}"
     )
 
-    # -----------------------------------------------------
-    # Existing lock for THIS stream only
-    # -----------------------------------------------------
     if current_registered_gate_state is not None:
         lock_age = now_ts - current_registered_ts
 
@@ -944,9 +1018,6 @@ async def update_gate_state_and_push(
 
         clear_registered_lock_for_stream(stream_id)
 
-    # -----------------------------------------------------
-    # Nothing found
-    # -----------------------------------------------------
     if (not vehicles) and (not plates):
         last_update = gate_state.get("lastUpdate")
         if gate_state.get("vehicleFound") and last_update and (now_ts - int(last_update) <= CLEAR_AFTER_MS):
@@ -967,13 +1038,6 @@ async def update_gate_state_and_push(
         push_gate_update(stream_id, gate_state)
         return gate_state
 
-    # -----------------------------------------------------
-    # Vehicle only, no plate this frame
-    # IMPORTANT: do not inherit another stream's plate.
-    # Only preserve this stream's current state if it was
-    # already registered and still within lock window.
-    # Otherwise keep plate/driver/vehicle cleared.
-    # -----------------------------------------------------
     if vehicles and not plates:
         existing_plate = None
         existing_driver = None
@@ -1156,6 +1220,12 @@ async def health():
     safe_last_error = getattr(pusher_client, "last_error", None)
     safe_disabled_until = getattr(pusher_client, "disabled_until", 0.0)
 
+    serial_open = False
+    try:
+        serial_open = bool(_serial_conn is not None and _serial_conn.is_open)
+    except Exception:
+        serial_open = False
+
     return {
         "status": "ok",
         "device": DEVICE,
@@ -1164,6 +1234,8 @@ async def health():
         "public_base_url": PUBLIC_BASE_URL or None,
         "serial_enabled": SERIAL_ENABLED,
         "serial_port": SERIAL_PORT if SERIAL_ENABLED else None,
+        "serial_open": serial_open,
+        "last_serial_command": last_serial_command,
         "stream_online_window_ms": STREAM_ONLINE_WINDOW_MS,
         "stream_stale_remove_ms": STREAM_STALE_REMOVE_MS,
         "active_gate_states": list(gate_states_by_stream.keys()),
@@ -1308,6 +1380,7 @@ async def detect_all(
     print(f"[/detect] gate_state={json.dumps(gate, default=str)}")
 
     light = await get_light_by_stream_id(sid)
+    print(f"[/detect] requested_stream_id={sid}")
     print(f"[/detect] light_mapping={json.dumps(light, default=str) if light else None}")
 
     light_command = get_light_command_from_gate(gate)
@@ -1316,8 +1389,9 @@ async def detect_all(
     print(f"[/detect] light_command={light_command}")
     print(f"[/detect] serial_command={serial_command}")
 
+    serial_sent = False
     if serial_command:
-        send_serial_command_to_pico(serial_command)
+        serial_sent = send_serial_command_to_pico(serial_command)
     else:
         print(f"[/detect] No active light mapping found for stream_id='{sid}', skipping serial send.")
 
@@ -1337,6 +1411,7 @@ async def detect_all(
             "light": light,
             "light_command": light_command,
             "serial_command": serial_command,
+            "serial_sent": serial_sent,
             "stream_id": sid,
         }
     )
