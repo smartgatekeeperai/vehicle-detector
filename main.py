@@ -125,7 +125,7 @@ def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
 # =========================================================
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8 + FastALPR",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -147,18 +147,50 @@ yolo_model.to(DEVICE)
 
 
 # =========================================================
-# GATE STATE (GLOBAL)
+# PER-STREAM GATE STATE
 # =========================================================
-gate_state: Dict[str, Any] = {
-    "vehicleFound": False,
-    "plate": None,
-    "driver": None,
-    "vehicle": None,
-    "lastUpdate": None,
-}
+def create_empty_gate_state(stream_id: str) -> Dict[str, Any]:
+    return {
+        "stream_id": stream_id,
+        "vehicleFound": False,
+        "plate": None,
+        "driver": None,
+        "vehicle": None,
+        "lastUpdate": None,
+    }
 
-current_registered_gate_state: Optional[Dict[str, Any]] = None
-current_registered_ts: int = 0
+
+gate_states_by_stream: Dict[str, Dict[str, Any]] = {}
+registered_gate_state_by_stream: Dict[str, Optional[Dict[str, Any]]] = {}
+registered_gate_ts_by_stream: Dict[str, int] = {}
+
+# Per-stream YOLO hold memory
+last_vehicle_detections_by_stream: Dict[str, List["VehicleDetection"]] = {}
+last_vehicle_ts_by_stream: Dict[str, float] = {}
+
+
+def get_gate_state_for_stream(stream_id: str) -> Dict[str, Any]:
+    if stream_id not in gate_states_by_stream:
+        gate_states_by_stream[stream_id] = create_empty_gate_state(stream_id)
+    return gate_states_by_stream[stream_id]
+
+
+def set_gate_state_for_stream(stream_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = {
+        "stream_id": stream_id,
+        "vehicleFound": bool(state.get("vehicleFound")),
+        "plate": state.get("plate"),
+        "driver": state.get("driver"),
+        "vehicle": state.get("vehicle"),
+        "lastUpdate": state.get("lastUpdate"),
+    }
+    gate_states_by_stream[stream_id] = normalized
+    return normalized
+
+
+def clear_registered_lock_for_stream(stream_id: str) -> None:
+    registered_gate_state_by_stream[stream_id] = None
+    registered_gate_ts_by_stream[stream_id] = 0
 
 
 # =========================================================
@@ -204,6 +236,19 @@ def cleanup_streams(current_ts: Optional[int] = None) -> None:
     ]
     for sid in stale_frame_ids:
         latest_frames.pop(sid, None)
+
+    # Optional cleanup of very old per-stream state
+    stale_state_ids = [
+        sid
+        for sid, state in gate_states_by_stream.items()
+        if state.get("lastUpdate") and (ts_ms - int(state["lastUpdate"])) > STREAM_STALE_REMOVE_MS
+    ]
+    for sid in stale_state_ids:
+        gate_states_by_stream.pop(sid, None)
+        registered_gate_state_by_stream.pop(sid, None)
+        registered_gate_ts_by_stream.pop(sid, None)
+        last_vehicle_detections_by_stream.pop(sid, None)
+        last_vehicle_ts_by_stream.pop(sid, None)
 
 
 def build_stream_list(current_ts: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -304,11 +349,14 @@ async def get_light_by_stream_id(stream_id: str) -> Optional[Dict[str, Any]]:
         FROM dbo."Lights"
         WHERE "Active" = true
           AND "CameraStreamId" = $1
-        LIMIT 1
+        ORDER BY "Name" ASC
     """
     rows = await db_query(sql, [stream_id])
     if not rows:
         return None
+
+    if len(rows) > 1:
+        print(f"[LIGHT WARNING] Multiple active Lights rows found for stream_id='{stream_id}': {rows}")
 
     return rows[0]
 
@@ -503,10 +551,6 @@ class VehicleDetection(BaseModel):
     class_name: str
 
 
-LAST_VEHICLE_DETECTIONS: List[VehicleDetection] = []
-LAST_VEHICLE_TS: float = 0.0
-
-
 # =========================================================
 # HELPERS (Image / YOLO / ALPR)
 # =========================================================
@@ -545,9 +589,7 @@ def build_vehicle_bbox(x1: float, y1: float, x2: float, y2: float, image_w: int,
     )
 
 
-def run_yolo_vehicles(img_np: np.ndarray) -> List[VehicleDetection]:
-    global LAST_VEHICLE_DETECTIONS, LAST_VEHICLE_TS
-
+def run_yolo_vehicles(img_np: np.ndarray, stream_id: str) -> List[VehicleDetection]:
     image_h, image_w = img_np.shape[:2]
 
     try:
@@ -563,8 +605,10 @@ def run_yolo_vehicles(img_np: np.ndarray) -> List[VehicleDetection]:
 
     if not results:
         now = time.time()
-        if LAST_VEHICLE_DETECTIONS and (now - LAST_VEHICLE_TS) <= HOLD_SECONDS:
-            return LAST_VEHICLE_DETECTIONS
+        last_dets = last_vehicle_detections_by_stream.get(stream_id, [])
+        last_ts = last_vehicle_ts_by_stream.get(stream_id, 0.0)
+        if last_dets and (now - last_ts) <= HOLD_SECONDS:
+            return last_dets
         return []
 
     result = results[0]
@@ -572,8 +616,10 @@ def run_yolo_vehicles(img_np: np.ndarray) -> List[VehicleDetection]:
 
     if boxes is None or len(boxes) == 0:
         now = time.time()
-        if LAST_VEHICLE_DETECTIONS and (now - LAST_VEHICLE_TS) <= HOLD_SECONDS:
-            return LAST_VEHICLE_DETECTIONS
+        last_dets = last_vehicle_detections_by_stream.get(stream_id, [])
+        last_ts = last_vehicle_ts_by_stream.get(stream_id, 0.0)
+        if last_dets and (now - last_ts) <= HOLD_SECONDS:
+            return last_dets
         return []
 
     detections: List[VehicleDetection] = []
@@ -599,8 +645,8 @@ def run_yolo_vehicles(img_np: np.ndarray) -> List[VehicleDetection]:
 
     detections.sort(key=lambda d: d.confidence, reverse=True)
 
-    LAST_VEHICLE_DETECTIONS = detections
-    LAST_VEHICLE_TS = time.time()
+    last_vehicle_detections_by_stream[stream_id] = detections
+    last_vehicle_ts_by_stream[stream_id] = time.time()
 
     return detections
 
@@ -688,7 +734,6 @@ def normalize_plate_text(plates: List[dict]) -> List[str]:
         )
         cleaned.append(normalized)
 
-    print("[GateState] cleaned_plates:", cleaned)
     return cleaned
 
 
@@ -840,109 +885,141 @@ async def insert_log_row(
 
 
 # =========================================================
-# GATE STATE LOGIC
+# GATE STATE LOGIC (PER STREAM)
 # =========================================================
+def push_gate_update(stream_id: str, gate: Dict[str, Any]) -> None:
+    payload = {
+        **gate,
+        "stream_id": stream_id,
+    }
+    try:
+        print(f"[GateState] pushing gate-update: {json.dumps(payload, default=str)}")
+        pusher_client.trigger("gate-channel", "gate-update", payload)
+    except Exception as e:
+        print("[Pusher] Error sending gate-update:", e)
+
+
 async def update_gate_state_and_push(
     vehicles: List[VehicleDetection],
     plates: List[dict],
     camera_source: str,
 ) -> Dict[str, Any]:
-    global gate_state, current_registered_gate_state, current_registered_ts
-
+    stream_id = (camera_source or "").strip() or "mobile-1"
     now_ts = now_ms()
     vehicle_count = len(vehicles)
 
+    gate_state = get_gate_state_for_stream(stream_id)
+    current_registered_gate_state = registered_gate_state_by_stream.get(stream_id)
+    current_registered_ts = registered_gate_ts_by_stream.get(stream_id, 0)
+
     print(
-        f"[GateState] update start | stream={camera_source} "
+        f"[GateState] update start | stream={stream_id} "
         f"| vehicles={vehicle_count} | plates={len(plates)}"
     )
 
+    # -----------------------------------------------------
+    # Existing lock for THIS stream only
+    # -----------------------------------------------------
     if current_registered_gate_state is not None:
         lock_age = now_ts - current_registered_ts
 
         if vehicle_count > 0 and lock_age <= PASS_LOCK_MS:
-            gate_state = {
-                **current_registered_gate_state,
-                "vehicleFound": True,
-                "lastUpdate": now_ts,
-            }
-            try:
-                print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-                pusher_client.trigger("gate-channel", "gate-update", gate_state)
-            except Exception as e:
-                print("[Pusher] Error (lock, vehicle present):", e)
+            gate_state = set_gate_state_for_stream(
+                stream_id,
+                {
+                    **current_registered_gate_state,
+                    "stream_id": stream_id,
+                    "vehicleFound": True,
+                    "lastUpdate": now_ts,
+                },
+            )
+            push_gate_update(stream_id, gate_state)
             return gate_state
 
         if vehicle_count == 0:
             last_update = gate_state.get("lastUpdate") or current_registered_ts
-            if now_ts - last_update <= CLEAR_AFTER_MS:
-                try:
-                    print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-                    pusher_client.trigger("gate-channel", "gate-update", gate_state)
-                except Exception as e:
-                    print("[Pusher] Error (lock, smooth clear window):", e)
+            if last_update and (now_ts - int(last_update) <= CLEAR_AFTER_MS):
+                push_gate_update(stream_id, gate_state)
                 return gate_state
 
-        current_registered_gate_state = None
-        current_registered_ts = 0
+        clear_registered_lock_for_stream(stream_id)
 
+    # -----------------------------------------------------
+    # Nothing found
+    # -----------------------------------------------------
     if (not vehicles) and (not plates):
         last_update = gate_state.get("lastUpdate")
-        if gate_state.get("vehicleFound") and last_update and (now_ts - last_update <= CLEAR_AFTER_MS):
-            try:
-                print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-                pusher_client.trigger("gate-channel", "gate-update", gate_state)
-            except Exception as e:
-                print("[Pusher] Error (B1 smooth no-vehicle window):", e)
+        if gate_state.get("vehicleFound") and last_update and (now_ts - int(last_update) <= CLEAR_AFTER_MS):
+            push_gate_update(stream_id, gate_state)
             return gate_state
 
-        gate_state = {
-            "vehicleFound": False,
-            "plate": None,
-            "driver": None,
-            "vehicle": None,
-            "lastUpdate": None,
-        }
-        try:
-            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-            pusher_client.trigger("gate-channel", "gate-update", gate_state)
-        except Exception as e:
-            print("[Pusher] Error (B1 reset):", e)
+        gate_state = set_gate_state_for_stream(
+            stream_id,
+            {
+                "stream_id": stream_id,
+                "vehicleFound": False,
+                "plate": None,
+                "driver": None,
+                "vehicle": None,
+                "lastUpdate": None,
+            },
+        )
+        push_gate_update(stream_id, gate_state)
         return gate_state
 
+    # -----------------------------------------------------
+    # Vehicle only, no plate this frame
+    # IMPORTANT: do not inherit another stream's plate.
+    # Only preserve this stream's current state if it was
+    # already registered and still within lock window.
+    # Otherwise keep plate/driver/vehicle cleared.
+    # -----------------------------------------------------
     if vehicles and not plates:
-        gate_state = {
-            "vehicleFound": True,
-            "plate": gate_state.get("plate"),
-            "driver": gate_state.get("driver"),
-            "vehicle": gate_state.get("vehicle"),
-            "lastUpdate": now_ts,
-        }
-        try:
-            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-            pusher_client.trigger("gate-channel", "gate-update", gate_state)
-        except Exception as e:
-            print("[Pusher] Error (B2 vehicles only):", e)
+        existing_plate = None
+        existing_driver = None
+        existing_vehicle = None
+
+        if current_registered_gate_state is not None:
+            lock_age = now_ts - current_registered_ts
+            if lock_age <= PASS_LOCK_MS:
+                existing_plate = current_registered_gate_state.get("plate")
+                existing_driver = current_registered_gate_state.get("driver")
+                existing_vehicle = current_registered_gate_state.get("vehicle")
+
+        gate_state = set_gate_state_for_stream(
+            stream_id,
+            {
+                "stream_id": stream_id,
+                "vehicleFound": True,
+                "plate": existing_plate,
+                "driver": existing_driver,
+                "vehicle": existing_vehicle,
+                "lastUpdate": now_ts,
+            },
+        )
+        push_gate_update(stream_id, gate_state)
         return gate_state
 
     cleaned_plates = normalize_plate_text(plates)
+    print(f"[GateState] stream={stream_id} cleaned_plates={cleaned_plates}")
+
     best_plate_text, best_plate_conf = pick_best_plate_text_and_conf(plates)
     ai_conf_bigint = to_ai_confidence_bigint(best_plate_conf)
-    image_preview = build_image_preview_url(camera_source)
+    image_preview = build_image_preview_url(stream_id)
 
     if not cleaned_plates:
-        gate_state = {
-            "vehicleFound": vehicle_count > 0,
-            "plate": gate_state.get("plate"),
-            "driver": gate_state.get("driver"),
-            "vehicle": gate_state.get("vehicle"),
-            "lastUpdate": now_ts,
-        }
-        try:
-            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-            pusher_client.trigger("gate-channel", "gate-update", gate_state)
-        except Exception as e:
-            print("[Pusher] Error (B3 no cleaned plates):", e)
+        gate_state = set_gate_state_for_stream(
+            stream_id,
+            {
+                "stream_id": stream_id,
+                "vehicleFound": vehicle_count > 0,
+                "plate": None,
+                "driver": None,
+                "vehicle": None,
+                "lastUpdate": now_ts,
+            },
+        )
+        push_gate_update(stream_id, gate_state)
         return gate_state
 
     try:
@@ -958,18 +1035,18 @@ async def update_gate_state_and_push(
         rows = await db_query(sql, [cleaned_plates])
     except Exception as db_err:
         print("[GateState] DB error:", db_err)
-        gate_state = {
-            "vehicleFound": vehicle_count > 0,
-            "plate": gate_state.get("plate"),
-            "driver": gate_state.get("driver"),
-            "vehicle": gate_state.get("vehicle"),
-            "lastUpdate": now_ts,
-        }
-        try:
-            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-            pusher_client.trigger("gate-channel", "gate-update", gate_state)
-        except Exception as e:
-            print("[Pusher] Error (B4 DB error):", e)
+        gate_state = set_gate_state_for_stream(
+            stream_id,
+            {
+                "stream_id": stream_id,
+                "vehicleFound": vehicle_count > 0,
+                "plate": None,
+                "driver": None,
+                "vehicle": None,
+                "lastUpdate": now_ts,
+            },
+        )
+        push_gate_update(stream_id, gate_state)
         return gate_state
 
     async def should_insert_log(plate_number: str) -> bool:
@@ -992,7 +1069,7 @@ async def update_gate_state_and_push(
                         vehicle_json=None,
                         role_type="Visitors",
                         verification="NOT REGISTERED",
-                        camera_source=camera_source,
+                        camera_source=stream_id,
                         image_preview=image_preview,
                         ai_confidence=ai_conf_bigint,
                     )
@@ -1002,18 +1079,18 @@ async def update_gate_state_and_push(
             except Exception as e:
                 print("[Logs] Failed to write NOT REGISTERED Logs row:", e)
 
-        gate_state = {
-            "vehicleFound": vehicle_count > 0,
-            "plate": None,
-            "driver": None,
-            "vehicle": None,
-            "lastUpdate": now_ts,
-        }
-        try:
-            print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-            pusher_client.trigger("gate-channel", "gate-update", gate_state)
-        except Exception as e:
-            print("[Pusher] Error (B4 no rows):", e)
+        gate_state = set_gate_state_for_stream(
+            stream_id,
+            {
+                "stream_id": stream_id,
+                "vehicleFound": vehicle_count > 0,
+                "plate": None,
+                "driver": None,
+                "vehicle": None,
+                "lastUpdate": now_ts,
+            },
+        )
+        push_gate_update(stream_id, gate_state)
         return gate_state
 
     vehicle_details = rows[0]
@@ -1040,7 +1117,7 @@ async def update_gate_state_and_push(
                 vehicle_json=vehicle_json,
                 role_type=(raw_driver or {}).get("RoleType") if isinstance(raw_driver, dict) else None,
                 verification="REGISTERED",
-                camera_source=camera_source,
+                camera_source=stream_id,
                 image_preview=image_preview,
                 ai_confidence=ai_conf_bigint,
             )
@@ -1050,26 +1127,25 @@ async def update_gate_state_and_push(
     except Exception as e:
         print("[Logs] Failed to write REGISTERED Logs row:", e)
 
-    new_state = {
-        "vehicleFound": True,
-        "plate": registered_plate,
-        "driver": raw_driver,
-        "vehicle": vehicle_json,
-        "lastUpdate": now_ts,
-    }
+    new_state = set_gate_state_for_stream(
+        stream_id,
+        {
+            "stream_id": stream_id,
+            "vehicleFound": True,
+            "plate": registered_plate,
+            "driver": raw_driver,
+            "vehicle": vehicle_json,
+            "lastUpdate": now_ts,
+        },
+    )
 
-    gate_state = new_state
-    current_registered_gate_state = new_state
-    current_registered_ts = now_ts
+    registered_gate_state_by_stream[stream_id] = dict(new_state)
+    registered_gate_ts_by_stream[stream_id] = now_ts
 
-    try:
-        print(f"[GateState] registered match -> {json.dumps(gate_state, default=str)}")
-        print(f"[GateState] pushing gate-update: {json.dumps(gate_state, default=str)}")
-        pusher_client.trigger("gate-channel", "gate-update", gate_state)
-    except Exception as e:
-        print("[Pusher] Error (registered trigger):", e)
+    print(f"[GateState] stream={stream_id} registered match -> {json.dumps(new_state, default=str)}")
+    push_gate_update(stream_id, new_state)
 
-    return gate_state
+    return new_state
 
 
 # =========================================================
@@ -1090,6 +1166,7 @@ async def health():
         "serial_port": SERIAL_PORT if SERIAL_ENABLED else None,
         "stream_online_window_ms": STREAM_ONLINE_WINDOW_MS,
         "stream_stale_remove_ms": STREAM_STALE_REMOVE_MS,
+        "active_gate_states": list(gate_states_by_stream.keys()),
         "realtime": {
             "mode": pusher_mode,
             "reason": pusher_reason,
@@ -1170,6 +1247,7 @@ async def get_latest_frame(stream_id: str = Query("mobile-1")):
 @app.post("/test-pusher")
 async def test_pusher():
     payload = {
+        "stream_id": "test-stream",
         "vehicleFound": True,
         "plate": "TEST-123",
         "driver": {"fullName": "Test Driver"},
@@ -1213,7 +1291,7 @@ async def detect_all(
 
     t0 = time.time()
 
-    vehicles = run_yolo_vehicles(img_np)
+    vehicles = run_yolo_vehicles(img_np, sid)
     alpr_result = run_alpr(img_np, detector_name, ocr_name)
     plates = alpr_result["plates"]
 
