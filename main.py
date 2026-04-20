@@ -94,14 +94,20 @@ STREAM_STALE_REMOVE_MS = int(os.getenv("STREAM_STALE_REMOVE_MS", "60000"))
 SERIAL_ENABLED = os.getenv("SERIAL_ENABLED", "false").lower() == "true"
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")
 SERIAL_BAUDRATE = int(os.getenv("SERIAL_BAUDRATE", "115200"))
-SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "0.25"))
+SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "0.20"))
 SERIAL_WRITE_TIMEOUT = float(os.getenv("SERIAL_WRITE_TIMEOUT", "0.25"))
 SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "1.0"))
 SERIAL_REOPEN_COOLDOWN_MS = int(os.getenv("SERIAL_REOPEN_COOLDOWN_MS", "1000"))
 
+# New ACK-based reliability settings
+SERIAL_ACK_TIMEOUT = float(os.getenv("SERIAL_ACK_TIMEOUT", "1.6"))
+SERIAL_ACK_RETRY_COUNT = int(os.getenv("SERIAL_ACK_RETRY_COUNT", "1"))
+
 last_serial_command: Optional[str] = None
 last_serial_error: Optional[str] = None
 last_serial_error_ts: Optional[int] = None
+last_serial_ack: Optional[str] = None
+last_serial_ack_ts: Optional[int] = None
 
 # Use RLock so nested cleanup never deadlocks
 _serial_lock = threading.RLock()
@@ -140,7 +146,7 @@ def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
 # =========================================================
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8 + FastALPR",
-    version="1.3.0",
+    version="1.4.0",
 )
 
 app.add_middleware(
@@ -322,10 +328,9 @@ async def startup():
             print("[DB] Failed to create pool:", e)
             app.state.db_pool = None
 
-    # Optional pre-open only. Failure must not stop app.
     if SERIAL_ENABLED:
         try:
-            ser = await asyncio.to_thread(get_serial_connection)
+            ser = await asyncio.to_thread(get_serial_connection, True)
             if ser is not None:
                 print(f"[SERIAL] Ready on {SERIAL_PORT}")
         except Exception as e:
@@ -819,7 +824,57 @@ def close_serial_connection() -> None:
         close_serial_connection_unlocked()
 
 
-def get_serial_connection():
+def build_expected_ack(command_line: str) -> str:
+    return f"ACK {command_line.strip()}"
+
+
+def read_matching_ack_unlocked(expected_ack: str, timeout_s: float) -> bool:
+    global last_serial_ack, last_serial_ack_ts, last_serial_error, last_serial_error_ts
+
+    deadline = time.time() + max(0.1, timeout_s)
+    collected_lines: List[str] = []
+
+    while time.time() < deadline:
+        try:
+            if _serial_conn is None or not _serial_conn.is_open:
+                last_serial_error = f"Serial closed while waiting for ACK on {SERIAL_PORT}"
+                last_serial_error_ts = now_ms()
+                return False
+
+            line = _serial_conn.readline()
+            if not line:
+                continue
+
+            text = line.decode("utf-8", errors="ignore").strip()
+            if not text:
+                continue
+
+            collected_lines.append(text)
+            print(f"[SERIAL] Pico: {text}")
+
+            if text == expected_ack:
+                last_serial_ack = text
+                last_serial_ack_ts = now_ms()
+                last_serial_error = None
+                last_serial_error_ts = None
+                return True
+
+        except Exception as e:
+            last_serial_error = str(e)
+            last_serial_error_ts = now_ms()
+            print(f"[SERIAL] ACK read failed: {e}")
+            return False
+
+    last_serial_error = f"ACK timeout waiting for '{expected_ack}'"
+    last_serial_error_ts = now_ms()
+    if collected_lines:
+        print(f"[SERIAL] ACK timeout. Last Pico lines: {collected_lines}")
+    else:
+        print(f"[SERIAL] ACK timeout. No Pico response for '{expected_ack}'")
+    return False
+
+
+def get_serial_connection(force: bool = False):
     global _serial_conn, _serial_last_open_attempt_ms
 
     if not SERIAL_ENABLED:
@@ -837,7 +892,7 @@ def get_serial_connection():
             _serial_conn = None
 
         now = now_ms()
-        if (now - _serial_last_open_attempt_ms) < SERIAL_REOPEN_COOLDOWN_MS:
+        if (not force) and ((now - _serial_last_open_attempt_ms) < SERIAL_REOPEN_COOLDOWN_MS):
             return None
 
         _serial_last_open_attempt_ms = now
@@ -872,24 +927,17 @@ def get_serial_connection():
             return None
 
 
-def send_serial_command_to_pico(command_line: str) -> bool:
+def try_send_serial_command_once(command_line: str, force_open: bool = False) -> bool:
     global last_serial_command, last_serial_error, last_serial_error_ts
 
-    if not SERIAL_ENABLED:
-        print(f"[SERIAL] Skipped (disabled): {command_line}")
-        return False
-
-    command_line = (command_line or "").strip()
-    if not command_line:
-        print("[SERIAL] Empty command line")
-        return False
-
-    ser = get_serial_connection()
+    ser = get_serial_connection(force=force_open)
     if ser is None:
         last_serial_error = f"Serial unavailable on {SERIAL_PORT}"
         last_serial_error_ts = now_ms()
         print(f"[SERIAL] {last_serial_error}")
         return False
+
+    expected_ack = build_expected_ack(command_line)
 
     with _serial_lock:
         try:
@@ -899,16 +947,24 @@ def send_serial_command_to_pico(command_line: str) -> bool:
                 print(f"[SERIAL] {last_serial_error}")
                 return False
 
+            try:
+                _serial_conn.reset_input_buffer()
+            except Exception:
+                pass
+
             payload = (command_line + "\n").encode("utf-8")
             _serial_conn.write(payload)
             _serial_conn.flush()
 
             last_serial_command = command_line
-            last_serial_error = None
-            last_serial_error_ts = None
-
             print(f"[SERIAL] Sent to Pico: {command_line}")
-            return True
+
+            ack_ok = read_matching_ack_unlocked(expected_ack, SERIAL_ACK_TIMEOUT)
+            if ack_ok:
+                return True
+
+            close_serial_connection_unlocked()
+            return False
 
         except (SerialException, OSError, PermissionError) as e:
             last_serial_error = str(e)
@@ -923,6 +979,31 @@ def send_serial_command_to_pico(command_line: str) -> bool:
             print(f"[SERIAL] Unexpected send error for '{command_line}': {e}")
             close_serial_connection_unlocked()
             return False
+
+
+def send_serial_command_to_pico(command_line: str) -> bool:
+    if not SERIAL_ENABLED:
+        print(f"[SERIAL] Skipped (disabled): {command_line}")
+        return False
+
+    command_line = (command_line or "").strip()
+    if not command_line:
+        print("[SERIAL] Empty command line")
+        return False
+
+    # First try
+    if try_send_serial_command_once(command_line, force_open=False):
+        return True
+
+    # Retry with forced reopen
+    retries = max(0, SERIAL_ACK_RETRY_COUNT)
+    for attempt in range(retries):
+        print(f"[SERIAL] Retrying serial command ({attempt + 1}/{retries}): {command_line}")
+        time.sleep(0.15)
+        if try_send_serial_command_once(command_line, force_open=True):
+            return True
+
+    return False
 
 
 # =========================================================
@@ -1283,6 +1364,8 @@ async def health():
         "last_serial_command": last_serial_command,
         "last_serial_error": last_serial_error,
         "last_serial_error_ts": last_serial_error_ts,
+        "last_serial_ack": last_serial_ack,
+        "last_serial_ack_ts": last_serial_ack_ts,
         "stream_online_window_ms": STREAM_ONLINE_WINDOW_MS,
         "stream_stale_remove_ms": STREAM_STALE_REMOVE_MS,
         "active_gate_states": list(gate_states_by_stream.keys()),
@@ -1438,7 +1521,6 @@ async def detect_all(
 
     serial_sent = False
     if serial_command:
-        # run serial write in thread so event loop stays responsive
         serial_sent = await asyncio.to_thread(send_serial_command_to_pico, serial_command)
     else:
         print(f"[/detect] No active light mapping found for stream_id='{sid}', skipping serial send.")
