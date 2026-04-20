@@ -6,6 +6,7 @@ import socket
 import tempfile
 import traceback
 import threading
+import asyncio
 from functools import lru_cache
 from typing import List, Optional, Literal, get_args, Any, Dict, Tuple
 
@@ -41,8 +42,10 @@ from fast_alpr.default_ocr import OcrModel
 # =========================================================
 try:
     import serial  # pip install pyserial
+    from serial import SerialException
 except Exception:
     serial = None
+    SerialException = Exception
 
 
 # =========================================================
@@ -91,12 +94,19 @@ STREAM_STALE_REMOVE_MS = int(os.getenv("STREAM_STALE_REMOVE_MS", "60000"))
 SERIAL_ENABLED = os.getenv("SERIAL_ENABLED", "false").lower() == "true"
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")
 SERIAL_BAUDRATE = int(os.getenv("SERIAL_BAUDRATE", "115200"))
-SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "1"))
-SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))
+SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "0.25"))
+SERIAL_WRITE_TIMEOUT = float(os.getenv("SERIAL_WRITE_TIMEOUT", "0.25"))
+SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "1.0"))
+SERIAL_REOPEN_COOLDOWN_MS = int(os.getenv("SERIAL_REOPEN_COOLDOWN_MS", "1000"))
 
 last_serial_command: Optional[str] = None
-_serial_lock = threading.Lock()
+last_serial_error: Optional[str] = None
+last_serial_error_ts: Optional[int] = None
+
+# Use RLock so nested cleanup never deadlocks
+_serial_lock = threading.RLock()
 _serial_conn = None
+_serial_last_open_attempt_ms = 0
 
 
 # =========================================================
@@ -130,7 +140,7 @@ def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
 # =========================================================
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8 + FastALPR",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 app.add_middleware(
@@ -312,10 +322,10 @@ async def startup():
             print("[DB] Failed to create pool:", e)
             app.state.db_pool = None
 
-    # Pre-open serial once on startup if enabled
+    # Optional pre-open only. Failure must not stop app.
     if SERIAL_ENABLED:
         try:
-            ser = get_serial_connection()
+            ser = await asyncio.to_thread(get_serial_connection)
             if ser is not None:
                 print(f"[SERIAL] Ready on {SERIAL_PORT}")
         except Exception as e:
@@ -329,7 +339,10 @@ async def shutdown():
         await pool.close()
         print("[DB] Pool closed")
 
-    close_serial_connection()
+    try:
+        close_serial_connection()
+    except Exception:
+        pass
     print("[SERIAL] Port closed")
 
 
@@ -791,19 +804,23 @@ def build_image_preview_url(stream_id: str) -> str:
 # =========================================================
 # SERIAL HELPERS
 # =========================================================
-def close_serial_connection() -> None:
+def close_serial_connection_unlocked() -> None:
     global _serial_conn
+    try:
+        if _serial_conn is not None and _serial_conn.is_open:
+            _serial_conn.close()
+    except Exception:
+        pass
+    _serial_conn = None
+
+
+def close_serial_connection() -> None:
     with _serial_lock:
-        try:
-            if _serial_conn is not None and _serial_conn.is_open:
-                _serial_conn.close()
-        except Exception:
-            pass
-        _serial_conn = None
+        close_serial_connection_unlocked()
 
 
 def get_serial_connection():
-    global _serial_conn
+    global _serial_conn, _serial_last_open_attempt_ms
 
     if not SERIAL_ENABLED:
         return None
@@ -812,45 +829,51 @@ def get_serial_connection():
         print("[SERIAL] pyserial is not installed.")
         return None
 
-    try:
-        if _serial_conn is not None and _serial_conn.is_open:
+    with _serial_lock:
+        try:
+            if _serial_conn is not None and _serial_conn.is_open:
+                return _serial_conn
+        except Exception:
+            _serial_conn = None
+
+        now = now_ms()
+        if (now - _serial_last_open_attempt_ms) < SERIAL_REOPEN_COOLDOWN_MS:
+            return None
+
+        _serial_last_open_attempt_ms = now
+
+        try:
+            print(f"[SERIAL] Opening port {SERIAL_PORT} ...")
+            _serial_conn = serial.Serial(
+                SERIAL_PORT,
+                SERIAL_BAUDRATE,
+                timeout=SERIAL_TIMEOUT,
+                write_timeout=SERIAL_WRITE_TIMEOUT,
+            )
+
+            time.sleep(SERIAL_OPEN_DELAY)
+
+            try:
+                _serial_conn.reset_input_buffer()
+            except Exception:
+                pass
+
+            try:
+                _serial_conn.reset_output_buffer()
+            except Exception:
+                pass
+
+            print(f"[SERIAL] Port opened: {SERIAL_PORT}")
             return _serial_conn
-    except Exception:
-        _serial_conn = None
 
-    try:
-        print(f"[SERIAL] Opening port {SERIAL_PORT} ...")
-        _serial_conn = serial.Serial(
-            SERIAL_PORT,
-            SERIAL_BAUDRATE,
-            timeout=SERIAL_TIMEOUT,
-            write_timeout=SERIAL_TIMEOUT,
-        )
-
-        # Give MicroPython/USB serial a moment only when opening
-        time.sleep(SERIAL_OPEN_DELAY)
-
-        try:
-            _serial_conn.reset_input_buffer()
-        except Exception:
-            pass
-
-        try:
-            _serial_conn.reset_output_buffer()
-        except Exception:
-            pass
-
-        print(f"[SERIAL] Port opened: {SERIAL_PORT}")
-        return _serial_conn
-
-    except Exception as e:
-        print(f"[SERIAL] Failed to open port {SERIAL_PORT}: {e}")
-        _serial_conn = None
-        return None
+        except Exception as e:
+            print(f"[SERIAL] Failed to open port {SERIAL_PORT}: {e}")
+            _serial_conn = None
+            return None
 
 
 def send_serial_command_to_pico(command_line: str) -> bool:
-    global last_serial_command
+    global last_serial_command, last_serial_error, last_serial_error_ts
 
     if not SERIAL_ENABLED:
         print(f"[SERIAL] Skipped (disabled): {command_line}")
@@ -861,22 +884,44 @@ def send_serial_command_to_pico(command_line: str) -> bool:
         print("[SERIAL] Empty command line")
         return False
 
-    with _serial_lock:
-        ser = get_serial_connection()
-        if ser is None:
-            return False
+    ser = get_serial_connection()
+    if ser is None:
+        last_serial_error = f"Serial unavailable on {SERIAL_PORT}"
+        last_serial_error_ts = now_ms()
+        print(f"[SERIAL] {last_serial_error}")
+        return False
 
+    with _serial_lock:
         try:
+            if _serial_conn is None or not _serial_conn.is_open:
+                last_serial_error = f"Serial closed before send on {SERIAL_PORT}"
+                last_serial_error_ts = now_ms()
+                print(f"[SERIAL] {last_serial_error}")
+                return False
+
             payload = (command_line + "\n").encode("utf-8")
-            ser.write(payload)
-            ser.flush()
+            _serial_conn.write(payload)
+            _serial_conn.flush()
+
             last_serial_command = command_line
+            last_serial_error = None
+            last_serial_error_ts = None
+
             print(f"[SERIAL] Sent to Pico: {command_line}")
             return True
 
-        except Exception as e:
+        except (SerialException, OSError, PermissionError) as e:
+            last_serial_error = str(e)
+            last_serial_error_ts = now_ms()
             print(f"[SERIAL] Failed to send '{command_line}' to Pico: {e}")
-            close_serial_connection()
+            close_serial_connection_unlocked()
+            return False
+
+        except Exception as e:
+            last_serial_error = str(e)
+            last_serial_error_ts = now_ms()
+            print(f"[SERIAL] Unexpected send error for '{command_line}': {e}")
+            close_serial_connection_unlocked()
             return False
 
 
@@ -1236,6 +1281,8 @@ async def health():
         "serial_port": SERIAL_PORT if SERIAL_ENABLED else None,
         "serial_open": serial_open,
         "last_serial_command": last_serial_command,
+        "last_serial_error": last_serial_error,
+        "last_serial_error_ts": last_serial_error_ts,
         "stream_online_window_ms": STREAM_ONLINE_WINDOW_MS,
         "stream_stale_remove_ms": STREAM_STALE_REMOVE_MS,
         "active_gate_states": list(gate_states_by_stream.keys()),
@@ -1391,7 +1438,8 @@ async def detect_all(
 
     serial_sent = False
     if serial_command:
-        serial_sent = send_serial_command_to_pico(serial_command)
+        # run serial write in thread so event loop stays responsive
+        serial_sent = await asyncio.to_thread(send_serial_command_to_pico, serial_command)
     else:
         print(f"[/detect] No active light mapping found for stream_id='{sid}', skipping serial send.")
 
