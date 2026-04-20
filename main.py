@@ -24,7 +24,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
-from PIL import Image
+from PIL import Image, ImageOps
 
 from ultralytics import YOLO
 import torch
@@ -34,6 +34,8 @@ from pusher import Pusher
 from fast_alpr import ALPR
 from fast_alpr.default_detector import PlateDetectorModel
 from fast_alpr.default_ocr import OcrModel
+
+from paddleocr import PaddleOCR
 
 # =========================================================
 # OPTIONAL SERIAL (PC -> Pico)
@@ -69,19 +71,34 @@ CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.5"))
 IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.5"))
 HOLD_SECONDS = float(os.getenv("HOLD_SECONDS", "0.7"))
 
-# Gate smoothing / lock behavior
 PASS_LOCK_MS = int(os.getenv("PASS_LOCK_MS", "10000"))
 CLEAR_AFTER_MS = int(os.getenv("CLEAR_AFTER_MS", "5000"))
 
-# Logging window rule (5 minutes)
 LOG_WINDOW_MS = int(os.getenv("LOG_WINDOW_MS", str(5 * 60 * 1000)))
 
-# Used for ImagePreview in Logs
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 
-# Stream registry timing
 STREAM_ONLINE_WINDOW_MS = int(os.getenv("STREAM_ONLINE_WINDOW_MS", "5000"))
 STREAM_STALE_REMOVE_MS = int(os.getenv("STREAM_STALE_REMOVE_MS", "60000"))
+
+FULL_IMAGE_MAX_SIDE = int(os.getenv("FULL_IMAGE_MAX_SIDE", "1600"))
+
+VEHICLE_CROP_PADDING_X = float(os.getenv("VEHICLE_CROP_PADDING_X", "0.16"))
+VEHICLE_CROP_PADDING_Y = float(os.getenv("VEHICLE_CROP_PADDING_Y", "0.20"))
+
+PLATE_REFINEMENT_PADDING_LEFT = float(os.getenv("PLATE_REFINEMENT_PADDING_LEFT", "0.06"))
+PLATE_REFINEMENT_PADDING_RIGHT = float(os.getenv("PLATE_REFINEMENT_PADDING_RIGHT", "0.10"))
+PLATE_REFINEMENT_PADDING_TOP = float(os.getenv("PLATE_REFINEMENT_PADDING_TOP", "0.08"))
+PLATE_REFINEMENT_PADDING_BOTTOM = float(os.getenv("PLATE_REFINEMENT_PADDING_BOTTOM", "0.08"))
+
+PLATE_NUMBER_BAND_TOP = float(os.getenv("PLATE_NUMBER_BAND_TOP", "0.33"))
+PLATE_NUMBER_BAND_BOTTOM = float(os.getenv("PLATE_NUMBER_BAND_BOTTOM", "0.82"))
+PLATE_NUMBER_BAND_LEFT = float(os.getenv("PLATE_NUMBER_BAND_LEFT", "0.01"))
+PLATE_NUMBER_BAND_RIGHT = float(os.getenv("PLATE_NUMBER_BAND_RIGHT", "0.99"))
+
+MIN_PLATE_TEXT_LEN = int(os.getenv("MIN_PLATE_TEXT_LEN", "6"))
+
+PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "en")
 
 
 # =========================================================
@@ -95,7 +112,7 @@ SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))
 
 
 # =========================================================
-# FASTALPR CONFIG (PLATES)
+# FASTALPR CONFIG
 # =========================================================
 DETECTOR_MODELS: List[PlateDetectorModel] = list(get_args(PlateDetectorModel))
 OCR_MODELS: List[OcrModel] = list(get_args(OcrModel))
@@ -120,12 +137,23 @@ def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
     return ALPR(detector_model=detector_model, ocr_model=ocr_model)
 
 
+@lru_cache(maxsize=1)
+def get_paddle_ocr() -> PaddleOCR:
+    use_gpu = torch.cuda.is_available()
+    return PaddleOCR(
+        use_angle_cls=False,
+        lang=PADDLEOCR_LANG,
+        show_log=False,
+        use_gpu=use_gpu,
+    )
+
+
 # =========================================================
 # APP
 # =========================================================
 app = FastAPI(
-    title="Smart Gate Keeper - YOLOv8 + FastALPR",
-    version="1.1.0",
+    title="Smart Gate Keeper - YOLOv8 + FastALPR + Fast PaddleOCR",
+    version="1.4.1",
 )
 
 app.add_middleware(
@@ -164,7 +192,6 @@ gate_states_by_stream: Dict[str, Dict[str, Any]] = {}
 registered_gate_state_by_stream: Dict[str, Optional[Dict[str, Any]]] = {}
 registered_gate_ts_by_stream: Dict[str, int] = {}
 
-# Per-stream YOLO hold memory
 last_vehicle_detections_by_stream: Dict[str, List["VehicleDetection"]] = {}
 last_vehicle_ts_by_stream: Dict[str, float] = {}
 
@@ -237,7 +264,6 @@ def cleanup_streams(current_ts: Optional[int] = None) -> None:
     for sid in stale_frame_ids:
         latest_frames.pop(sid, None)
 
-    # Optional cleanup of very old per-stream state
     stale_state_ids = [
         sid
         for sid, state in gate_states_by_stream.items()
@@ -460,7 +486,6 @@ if not PUSHER_APP_ID:
     pusher_reason = "missing PUSHER_APP_ID"
     print(f"[Pusher] Dummy mode: {pusher_reason}")
     pusher_client = DummyPusher(pusher_reason)
-
 else:
     if USE_LOCAL_PUSHER_EFFECTIVE and PUSHER_HOST:
         local_reachable = can_connect_socket(
@@ -498,7 +523,6 @@ else:
             pusher_reason = f"local server not reachable at {PUSHER_HOST}:{PUSHER_PORT}"
             pusher_client = DummyPusher(pusher_reason)
             print(f"[Pusher] Dummy mode: {pusher_reason}")
-
     else:
         try:
             cloud_kwargs: Dict[str, Any] = {
@@ -552,7 +576,7 @@ class VehicleDetection(BaseModel):
 
 
 # =========================================================
-# HELPERS (Image / YOLO / ALPR)
+# HELPERS
 # =========================================================
 def load_image_to_numpy(data: bytes) -> np.ndarray:
     try:
@@ -589,66 +613,32 @@ def build_vehicle_bbox(x1: float, y1: float, x2: float, y2: float, image_w: int,
     )
 
 
-def run_yolo_vehicles(img_np: np.ndarray, stream_id: str) -> List[VehicleDetection]:
-    image_h, image_w = img_np.shape[:2]
+def resize_if_needed(img: Image.Image, max_side: int) -> Image.Image:
+    w, h = img.size
+    longest = max(w, h)
+    if longest <= max_side:
+        return img
+    scale = max_side / float(longest)
+    return img.resize(
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        Image.LANCZOS,
+    )
 
-    try:
-        results = yolo_model.predict(
-            img_np,
-            conf=CONF_THRESHOLD,
-            iou=IOU_THRESHOLD,
-            device=DEVICE,
-            verbose=False,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"YOLO inference error: {e}")
 
-    if not results:
-        now = time.time()
-        last_dets = last_vehicle_detections_by_stream.get(stream_id, [])
-        last_ts = last_vehicle_ts_by_stream.get(stream_id, 0.0)
-        if last_dets and (now - last_ts) <= HOLD_SECONDS:
-            return last_dets
-        return []
-
-    result = results[0]
-    boxes = result.boxes
-
-    if boxes is None or len(boxes) == 0:
-        now = time.time()
-        last_dets = last_vehicle_detections_by_stream.get(stream_id, [])
-        last_ts = last_vehicle_ts_by_stream.get(stream_id, 0.0)
-        if last_dets and (now - last_ts) <= HOLD_SECONDS:
-            return last_dets
-        return []
-
-    detections: List[VehicleDetection] = []
-
-    for box in boxes:
-        cls_id = int(box.cls.item())
-        conf = float(box.conf.item())
-
-        if cls_id not in VEHICLE_CLASS_IDS:
-            continue
-
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        bbox = build_vehicle_bbox(x1, y1, x2, y2, image_w, image_h)
-
-        detections.append(
-            VehicleDetection(
-                bbox=bbox,
-                confidence=conf,
-                class_id=cls_id,
-                class_name=VEHICLE_CLASS_NAMES.get(cls_id, f"class_{cls_id}"),
-            )
-        )
-
-    detections.sort(key=lambda d: d.confidence, reverse=True)
-
-    last_vehicle_detections_by_stream[stream_id] = detections
-    last_vehicle_ts_by_stream[stream_id] = time.time()
-
-    return detections
+def pad_image_horizontal(
+    img: Image.Image,
+    left_ratio: float = 0.08,
+    right_ratio: float = 0.16,
+    top_ratio: float = 0.06,
+    bottom_ratio: float = 0.06,
+    fill=(255, 255, 255),
+) -> Image.Image:
+    w, h = img.size
+    left = max(1, int(round(w * left_ratio)))
+    right = max(1, int(round(w * right_ratio)))
+    top = max(1, int(round(h * top_ratio)))
+    bottom = max(1, int(round(h * bottom_ratio)))
+    return ImageOps.expand(img, border=(left, top, right, bottom), fill=fill)
 
 
 def serialize_alpr_result(result) -> dict:
@@ -681,7 +671,7 @@ def serialize_alpr_result(result) -> dict:
     return {"ocr": ocr, "bbox": bbox}
 
 
-def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str) -> dict:
+def run_plate_detector_on_pil(pil_img: Image.Image, detector_name: str, ocr_name: str) -> List[dict]:
     try:
         alpr = get_alpr(detector_name, ocr_name)
     except ValueError as e:
@@ -689,17 +679,15 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str) -> dict:
 
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             temp_path = tmp.name
 
-        Image.fromarray(img_np).save(temp_path, format="JPEG")
+        pil_img.save(temp_path, format="PNG", optimize=False)
         results = alpr.predict(temp_path)
-
     except Exception as e:
         print("[ALPR] Full traceback:")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"ALPR error: {e}")
-
     finally:
         if temp_path and os.path.exists(temp_path):
             try:
@@ -707,11 +695,199 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str) -> dict:
             except Exception:
                 pass
 
-    plates = [serialize_alpr_result(r) for r in results] if results else []
+    return [serialize_alpr_result(r) for r in results] if results else []
+
+
+def clamp_box(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> Tuple[int, int, int, int]:
+    x1 = max(0, min(x1, w - 1))
+    y1 = max(0, min(y1, h - 1))
+    x2 = max(x1 + 1, min(x2, w))
+    y2 = max(y1 + 1, min(y2, h))
+    return x1, y1, x2, y2
+
+
+def expand_local_plate_bbox(
+    bbox: Dict[str, int],
+    img_w: int,
+    img_h: int,
+    pad_left_ratio: float = PLATE_REFINEMENT_PADDING_LEFT,
+    pad_right_ratio: float = PLATE_REFINEMENT_PADDING_RIGHT,
+    pad_top_ratio: float = PLATE_REFINEMENT_PADDING_TOP,
+    pad_bottom_ratio: float = PLATE_REFINEMENT_PADDING_BOTTOM,
+) -> Tuple[int, int, int, int]:
+    x1 = int(bbox.get("x1", 0))
+    y1 = int(bbox.get("y1", 0))
+    x2 = int(bbox.get("x2", 0))
+    y2 = int(bbox.get("y2", 0))
+
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+
+    pad_left = int(round(width * pad_left_ratio))
+    pad_right = int(round(width * pad_right_ratio))
+    pad_top = int(round(height * pad_top_ratio))
+    pad_bottom = int(round(height * pad_bottom_ratio))
+
+    return clamp_box(
+        x1 - pad_left,
+        y1 - pad_top,
+        x2 + pad_right,
+        y2 + pad_bottom,
+        img_w,
+        img_h,
+    )
+
+
+def crop_number_band(plate_img: Image.Image) -> Image.Image:
+    w, h = plate_img.size
+
+    x1 = int(round(w * PLATE_NUMBER_BAND_LEFT))
+    x2 = int(round(w * PLATE_NUMBER_BAND_RIGHT))
+    y1 = int(round(h * PLATE_NUMBER_BAND_TOP))
+    y2 = int(round(h * PLATE_NUMBER_BAND_BOTTOM))
+
+    x1 = max(0, min(x1, w - 1))
+    x2 = max(x1 + 1, min(x2, w))
+    y1 = max(0, min(y1, h - 1))
+    y2 = max(y1 + 1, min(y2, h))
+
+    band = plate_img.crop((x1, y1, x2, y2))
+    band = pad_image_horizontal(band, left_ratio=0.02, right_ratio=0.04, top_ratio=0.06, bottom_ratio=0.06)
+    return band
+
+
+def clean_plate_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return "".join(ch for ch in text.upper() if ch.isalnum())
+
+
+def extract_best_numeric_plate(text: str) -> str:
+    cleaned = clean_plate_text(text)
+    if not cleaned:
+        return ""
+
+    digit_runs = []
+    current = []
+
+    for ch in cleaned:
+        if ch.isdigit():
+            current.append(ch)
+        else:
+            if current:
+                digit_runs.append("".join(current))
+                current = []
+    if current:
+        digit_runs.append("".join(current))
+
+    if digit_runs:
+        digit_runs.sort(key=len, reverse=True)
+        return digit_runs[0]
+
+    return cleaned
+
+
+def recognize_with_paddle(img: Image.Image) -> Tuple[str, float]:
+    ocr = get_paddle_ocr()
+    img_np = np.array(img.convert("RGB"))
+    try:
+        result = ocr.ocr(img_np, cls=False)
+    except Exception as e:
+        print(f"[PaddleOCR] recognize error: {e}")
+        return "", 0.0
+
+    if not result or not result[0]:
+        return "", 0.0
+
+    pieces: List[Tuple[float, str, float]] = []
+    for item in result[0]:
+        try:
+            box = item[0]
+            rec = item[1]
+            txt = str(rec[0] or "").strip()
+            conf = float(rec[1] or 0.0)
+            xs = [float(pt[0]) for pt in box]
+            left_x = min(xs) if xs else 0.0
+            if txt:
+                pieces.append((left_x, txt, conf))
+        except Exception:
+            continue
+
+    if not pieces:
+        return "", 0.0
+
+    pieces.sort(key=lambda x: x[0])
+    joined = "".join(clean_plate_text(t) for _, t, _ in pieces)
+    conf = float(sum(c for _, _, c in pieces) / len(pieces))
+
+    numeric = extract_best_numeric_plate(joined)
+    return numeric, conf
+
+
+def run_alpr(img_np: np.ndarray, vehicles: List[VehicleDetection], detector_name: str, ocr_name: str) -> dict:
+    base_full = Image.fromarray(img_np).convert("RGB")
+    base_full = resize_if_needed(base_full, FULL_IMAGE_MAX_SIDE)
+
+    detected_plates = run_plate_detector_on_pil(base_full, detector_name, ocr_name)
+
+    if not detected_plates:
+        return {
+            "model": {
+                "detector_model": detector_name,
+                "ocr_model": "paddleocr_fast",
+            },
+            "plates": [],
+        }
+
+    def bbox_area(p: dict) -> int:
+        bbox = p.get("bbox") or {}
+        return max(0, int(bbox.get("x2", 0)) - int(bbox.get("x1", 0))) * max(
+            0, int(bbox.get("y2", 0)) - int(bbox.get("y1", 0))
+        )
+
+    detected_plates.sort(key=bbox_area, reverse=True)
+    best = detected_plates[0]
+    bbox = best.get("bbox")
+
+    if not bbox:
+        return {
+            "model": {
+                "detector_model": detector_name,
+                "ocr_model": "paddleocr_fast",
+            },
+            "plates": [],
+        }
+
+    img_w, img_h = base_full.size
+    x1, y1, x2, y2 = expand_local_plate_bbox(bbox, img_w, img_h)
+    plate_crop = base_full.crop((x1, y1, x2, y2))
+    number_band = crop_number_band(plate_crop)
+
+    text, conf = recognize_with_paddle(number_band)
+
+    if not text or len(text) < MIN_PLATE_TEXT_LEN:
+        return {
+            "model": {
+                "detector_model": detector_name,
+                "ocr_model": "paddleocr_fast",
+            },
+            "plates": [],
+        }
+
+    plates = [
+        {
+            "ocr": {
+                "text": text,
+                "confidence": conf,
+            },
+            "bbox": bbox,
+        }
+    ]
+
     return {
         "model": {
             "detector_model": detector_name,
-            "ocr_model": ocr_name,
+            "ocr_model": "paddleocr_fast",
         },
         "plates": plates,
     }
@@ -739,7 +915,7 @@ def normalize_plate_text(plates: List[dict]) -> List[str]:
 
 def pick_best_plate_text_and_conf(plates: List[dict]) -> Tuple[Optional[str], float]:
     best_text = None
-    best_conf = 0.0
+    best_conf = -1.0
 
     for p in plates or []:
         ocr = p.get("ocr") or {}
@@ -757,7 +933,7 @@ def pick_best_plate_text_and_conf(plates: List[dict]) -> Tuple[Optional[str], fl
             best_conf = conf_val
             best_text = text
 
-    return best_text, best_conf
+    return best_text, max(0.0, best_conf)
 
 
 def to_ai_confidence_bigint(best_conf_0_1: float) -> int:
@@ -917,9 +1093,6 @@ async def update_gate_state_and_push(
         f"| vehicles={vehicle_count} | plates={len(plates)}"
     )
 
-    # -----------------------------------------------------
-    # Existing lock for THIS stream only
-    # -----------------------------------------------------
     if current_registered_gate_state is not None:
         lock_age = now_ts - current_registered_ts
 
@@ -944,9 +1117,6 @@ async def update_gate_state_and_push(
 
         clear_registered_lock_for_stream(stream_id)
 
-    # -----------------------------------------------------
-    # Nothing found
-    # -----------------------------------------------------
     if (not vehicles) and (not plates):
         last_update = gate_state.get("lastUpdate")
         if gate_state.get("vehicleFound") and last_update and (now_ts - int(last_update) <= CLEAR_AFTER_MS):
@@ -967,13 +1137,6 @@ async def update_gate_state_and_push(
         push_gate_update(stream_id, gate_state)
         return gate_state
 
-    # -----------------------------------------------------
-    # Vehicle only, no plate this frame
-    # IMPORTANT: do not inherit another stream's plate.
-    # Only preserve this stream's current state if it was
-    # already registered and still within lock window.
-    # Otherwise keep plate/driver/vehicle cleared.
-    # -----------------------------------------------------
     if vehicles and not plates:
         existing_plate = None
         existing_driver = None
@@ -1186,6 +1349,7 @@ async def alpr_models():
     return {
         "detector_models": DETECTOR_MODELS,
         "ocr_models": OCR_MODELS,
+        "active_recognizer": "paddleocr_fast",
     }
 
 
@@ -1264,6 +1428,68 @@ async def test_pusher():
     }
 
 
+def run_yolo_vehicles(img_np: np.ndarray, stream_id: str) -> List[VehicleDetection]:
+    image_h, image_w = img_np.shape[:2]
+
+    try:
+        results = yolo_model.predict(
+            img_np,
+            conf=CONF_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            device=DEVICE,
+            verbose=False,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"YOLO inference error: {e}")
+
+    if not results:
+        now = time.time()
+        last_dets = last_vehicle_detections_by_stream.get(stream_id, [])
+        last_ts = last_vehicle_ts_by_stream.get(stream_id, 0.0)
+        if last_dets and (now - last_ts) <= HOLD_SECONDS:
+            return last_dets
+        return []
+
+    result = results[0]
+    boxes = result.boxes
+
+    if boxes is None or len(boxes) == 0:
+        now = time.time()
+        last_dets = last_vehicle_detections_by_stream.get(stream_id, [])
+        last_ts = last_vehicle_ts_by_stream.get(stream_id, 0.0)
+        if last_dets and (now - last_ts) <= HOLD_SECONDS:
+            return last_dets
+        return []
+
+    detections: List[VehicleDetection] = []
+
+    for box in boxes:
+        cls_id = int(box.cls.item())
+        conf = float(box.conf.item())
+
+        if cls_id not in VEHICLE_CLASS_IDS:
+            continue
+
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        bbox = build_vehicle_bbox(x1, y1, x2, y2, image_w, image_h)
+
+        detections.append(
+            VehicleDetection(
+                bbox=bbox,
+                confidence=conf,
+                class_id=cls_id,
+                class_name=VEHICLE_CLASS_NAMES.get(cls_id, f"class_{cls_id}"),
+            )
+        )
+
+    detections.sort(key=lambda d: d.confidence, reverse=True)
+
+    last_vehicle_detections_by_stream[stream_id] = detections
+    last_vehicle_ts_by_stream[stream_id] = time.time()
+
+    return detections
+
+
 @app.post("/detect")
 async def detect_all(
     file: UploadFile = File(...),
@@ -1275,7 +1501,7 @@ async def detect_all(
         raise HTTPException(status_code=400, detail="File must be an image.")
 
     detector_name = detector_model or DETECTOR_MODELS[0]
-    ocr_name = ocr_model or OCR_MODELS[0]
+    ocr_name = ocr_model or OCR_MODELS[0]  # kept for compatibility
 
     data = await file.read()
     if not data:
@@ -1292,7 +1518,7 @@ async def detect_all(
     t0 = time.time()
 
     vehicles = run_yolo_vehicles(img_np, sid)
-    alpr_result = run_alpr(img_np, detector_name, ocr_name)
+    alpr_result = run_alpr(img_np, vehicles, detector_name, ocr_name)
     plates = alpr_result["plates"]
 
     print(f"[/detect] stream_id={sid}")
