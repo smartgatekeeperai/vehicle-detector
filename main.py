@@ -87,7 +87,6 @@ PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 STREAM_ONLINE_WINDOW_MS = int(os.getenv("STREAM_ONLINE_WINDOW_MS", "5000"))
 STREAM_STALE_REMOVE_MS = int(os.getenv("STREAM_STALE_REMOVE_MS", "60000"))
 
-
 # =========================================================
 # SERIAL CONFIG (PICO CONTROL)
 # =========================================================
@@ -99,15 +98,22 @@ SERIAL_WRITE_TIMEOUT = float(os.getenv("SERIAL_WRITE_TIMEOUT", "0.25"))
 SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "1.0"))
 SERIAL_REOPEN_COOLDOWN_MS = int(os.getenv("SERIAL_REOPEN_COOLDOWN_MS", "1000"))
 
-# New ACK-based reliability settings
+# ACK handling
 SERIAL_ACK_TIMEOUT = float(os.getenv("SERIAL_ACK_TIMEOUT", "1.6"))
 SERIAL_ACK_RETRY_COUNT = int(os.getenv("SERIAL_ACK_RETRY_COUNT", "1"))
+
+# New dedupe config
+SERIAL_COMMAND_DEDUPE_MS = int(os.getenv("SERIAL_COMMAND_DEDUPE_MS", "1200"))
 
 last_serial_command: Optional[str] = None
 last_serial_error: Optional[str] = None
 last_serial_error_ts: Optional[int] = None
 last_serial_ack: Optional[str] = None
 last_serial_ack_ts: Optional[int] = None
+
+# Track last sent command per light key
+last_sent_command_by_light: Dict[str, str] = {}
+last_sent_command_ts_by_light: Dict[str, int] = {}
 
 # Use RLock so nested cleanup never deadlocks
 _serial_lock = threading.RLock()
@@ -146,7 +152,7 @@ def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
 # =========================================================
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8 + FastALPR",
-    version="1.4.0",
+    version="1.5.0",
 )
 
 app.add_middleware(
@@ -828,8 +834,15 @@ def build_expected_ack(command_line: str) -> str:
     return f"ACK {command_line.strip()}"
 
 
-def read_matching_ack_unlocked(expected_ack: str, timeout_s: float) -> bool:
+def build_expected_ignored_prefix(command_line: str) -> str:
+    return f"IGNORED_COOLDOWN {command_line.strip()}"
+
+
+def read_matching_ack_unlocked(command_line: str, timeout_s: float) -> bool:
     global last_serial_ack, last_serial_ack_ts, last_serial_error, last_serial_error_ts
+
+    expected_ack = build_expected_ack(command_line)
+    expected_ignored_prefix = build_expected_ignored_prefix(command_line)
 
     deadline = time.time() + max(0.1, timeout_s)
     collected_lines: List[str] = []
@@ -853,6 +866,13 @@ def read_matching_ack_unlocked(expected_ack: str, timeout_s: float) -> bool:
             print(f"[SERIAL] Pico: {text}")
 
             if text == expected_ack:
+                last_serial_ack = text
+                last_serial_ack_ts = now_ms()
+                last_serial_error = None
+                last_serial_error_ts = None
+                return True
+
+            if text.startswith(expected_ignored_prefix):
                 last_serial_ack = text
                 last_serial_ack_ts = now_ms()
                 last_serial_error = None
@@ -927,6 +947,45 @@ def get_serial_connection(force: bool = False):
             return None
 
 
+def get_light_key_from_serial_command(command_line: str) -> str:
+    parts = command_line.strip().split()
+    if len(parts) >= 1:
+        return parts[0].strip().upper()
+    return "UNKNOWN"
+
+
+def get_cmd_from_serial_command(command_line: str) -> str:
+    parts = command_line.strip().split()
+    if len(parts) >= 3:
+        return parts[2].strip().lower()
+    return ""
+
+
+def should_skip_duplicate_serial_command(command_line: str) -> bool:
+    light_key = get_light_key_from_serial_command(command_line)
+    cmd = get_cmd_from_serial_command(command_line)
+    now = now_ms()
+
+    last_cmd = last_sent_command_by_light.get(light_key)
+    last_ts = last_sent_command_ts_by_light.get(light_key, 0)
+
+    if last_cmd == cmd and (now - last_ts) < SERIAL_COMMAND_DEDUPE_MS:
+        print(
+            f"[SERIAL] Duplicate suppressed for {light_key}: "
+            f"{cmd} ({now - last_ts}ms < {SERIAL_COMMAND_DEDUPE_MS}ms)"
+        )
+        return True
+
+    return False
+
+
+def mark_serial_command_sent(command_line: str) -> None:
+    light_key = get_light_key_from_serial_command(command_line)
+    cmd = get_cmd_from_serial_command(command_line)
+    last_sent_command_by_light[light_key] = cmd
+    last_sent_command_ts_by_light[light_key] = now_ms()
+
+
 def try_send_serial_command_once(command_line: str, force_open: bool = False) -> bool:
     global last_serial_command, last_serial_error, last_serial_error_ts
 
@@ -936,8 +995,6 @@ def try_send_serial_command_once(command_line: str, force_open: bool = False) ->
         last_serial_error_ts = now_ms()
         print(f"[SERIAL] {last_serial_error}")
         return False
-
-    expected_ack = build_expected_ack(command_line)
 
     with _serial_lock:
         try:
@@ -959,8 +1016,9 @@ def try_send_serial_command_once(command_line: str, force_open: bool = False) ->
             last_serial_command = command_line
             print(f"[SERIAL] Sent to Pico: {command_line}")
 
-            ack_ok = read_matching_ack_unlocked(expected_ack, SERIAL_ACK_TIMEOUT)
+            ack_ok = read_matching_ack_unlocked(command_line, SERIAL_ACK_TIMEOUT)
             if ack_ok:
+                mark_serial_command_sent(command_line)
                 return True
 
             close_serial_connection_unlocked()
@@ -990,6 +1048,10 @@ def send_serial_command_to_pico(command_line: str) -> bool:
     if not command_line:
         print("[SERIAL] Empty command line")
         return False
+
+    # Dedupe repeated sends before touching serial
+    if should_skip_duplicate_serial_command(command_line):
+        return True
 
     # First try
     if try_send_serial_command_once(command_line, force_open=False):
@@ -1366,6 +1428,7 @@ async def health():
         "last_serial_error_ts": last_serial_error_ts,
         "last_serial_ack": last_serial_ack,
         "last_serial_ack_ts": last_serial_ack_ts,
+        "last_sent_command_by_light": last_sent_command_by_light,
         "stream_online_window_ms": STREAM_ONLINE_WINDOW_MS,
         "stream_stale_remove_ms": STREAM_STALE_REMOVE_MS,
         "active_gate_states": list(gate_states_by_stream.keys()),
