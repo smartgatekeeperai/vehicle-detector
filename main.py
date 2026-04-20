@@ -51,8 +51,6 @@ except Exception:
 # =========================================================
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8x.pt")
 
-# COCO vehicle class IDs
-# 2 = car, 3 = motorcycle, 5 = bus, 7 = truck
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 
 VEHICLE_CLASS_NAMES = {
@@ -153,7 +151,7 @@ def get_paddle_ocr() -> PaddleOCR:
 # =========================================================
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8 + FastALPR + Fast PaddleOCR",
-    version="1.4.1",
+    version="1.4.3",
 )
 
 app.add_middleware(
@@ -641,6 +639,10 @@ def pad_image_horizontal(
     return ImageOps.expand(img, border=(left, top, right, bottom), fill=fill)
 
 
+def rotate_image_expand(img: Image.Image, angle_deg: float) -> Image.Image:
+    return img.rotate(angle_deg, expand=True, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
+
+
 def serialize_alpr_result(result) -> dict:
     ocr_obj = getattr(result, "ocr", None)
     ocr = None
@@ -698,6 +700,25 @@ def run_plate_detector_on_pil(pil_img: Image.Image, detector_name: str, ocr_name
     return [serialize_alpr_result(r) for r in results] if results else []
 
 
+def detect_plate_with_fallback_rotations(
+    base_img: Image.Image,
+    detector_name: str,
+    ocr_name: str,
+) -> Tuple[Image.Image, List[dict], float]:
+    detections = run_plate_detector_on_pil(base_img, detector_name, ocr_name)
+    if detections:
+        return base_img, detections, 0.0
+
+    for angle in (-25, -15, 15, 25):
+        rotated = rotate_image_expand(base_img, angle)
+        rotated_detections = run_plate_detector_on_pil(rotated, detector_name, ocr_name)
+        if rotated_detections:
+            print(f"[ALPR] fallback rotated detection success angle={angle}")
+            return rotated, rotated_detections, float(angle)
+
+    return base_img, [], 0.0
+
+
 def clamp_box(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> Tuple[int, int, int, int]:
     x1 = max(0, min(x1, w - 1))
     y1 = max(0, min(y1, h - 1))
@@ -737,14 +758,33 @@ def expand_local_plate_bbox(
         img_h,
     )
 
-
-def crop_number_band(plate_img: Image.Image) -> Image.Image:
+def crop_number_band(plate_img: Image.Image, mode: str = "tight") -> Image.Image:
+    """
+    Crop only the large digit row.
+    Different temporary plate layouts need slightly different vertical windows.
+    """
     w, h = plate_img.size
 
-    x1 = int(round(w * PLATE_NUMBER_BAND_LEFT))
-    x2 = int(round(w * PLATE_NUMBER_BAND_RIGHT))
-    y1 = int(round(h * PLATE_NUMBER_BAND_TOP))
-    y2 = int(round(h * PLATE_NUMBER_BAND_BOTTOM))
+    if mode == "tight":
+        # focus mostly on the large digits only
+        top = 0.22
+        bottom = 0.62
+    elif mode == "mid":
+        # include a bit more lower part of digits
+        top = 0.24
+        bottom = 0.68
+    elif mode == "low":
+        # fallback for slanted plates where digits sit lower
+        top = 0.28
+        bottom = 0.72
+    else:
+        top = PLATE_NUMBER_BAND_TOP
+        bottom = PLATE_NUMBER_BAND_BOTTOM
+
+    x1 = int(round(w * 0.02))
+    x2 = int(round(w * 0.98))
+    y1 = int(round(h * top))
+    y2 = int(round(h * bottom))
 
     x1 = max(0, min(x1, w - 1))
     x2 = max(x1 + 1, min(x2, w))
@@ -752,9 +792,14 @@ def crop_number_band(plate_img: Image.Image) -> Image.Image:
     y2 = max(y1 + 1, min(y2, h))
 
     band = plate_img.crop((x1, y1, x2, y2))
-    band = pad_image_horizontal(band, left_ratio=0.02, right_ratio=0.04, top_ratio=0.06, bottom_ratio=0.06)
+    band = pad_image_horizontal(
+        band,
+        left_ratio=0.02,
+        right_ratio=0.03,
+        top_ratio=0.04,
+        bottom_ratio=0.04,
+    )
     return band
-
 
 def clean_plate_text(text: Optional[str]) -> str:
     if not text:
@@ -780,12 +825,39 @@ def extract_best_numeric_plate(text: str) -> str:
     if current:
         digit_runs.append("".join(current))
 
-    if digit_runs:
-        digit_runs.sort(key=len, reverse=True)
-        return digit_runs[0]
+    if not digit_runs:
+        return cleaned
 
-    return cleaned
+    digit_runs.sort(key=len, reverse=True)
+    best = digit_runs[0]
 
+    if len(best) == 11 and best[1] == "0":
+        best = best[1:]
+
+    return best
+
+def score_numeric_candidate(text: str, conf: float) -> float:
+    cleaned = clean_plate_text(text)
+    if not cleaned:
+        return -9999.0
+
+    digits = "".join(ch for ch in cleaned if ch.isdigit())
+    alpha_count = sum(ch.isalpha() for ch in cleaned)
+    digit_count = len(digits)
+
+    score = float(conf)
+    score += digit_count * 0.20
+    score -= alpha_count * 0.25
+
+    if digit_count >= 8:
+        score += 0.50
+    if digit_count >= 10:
+        score += 0.80
+
+    if digit_count == 0:
+        score -= 2.0
+
+    return score
 
 def recognize_with_paddle(img: Image.Image) -> Tuple[str, float]:
     ocr = get_paddle_ocr()
@@ -821,14 +893,21 @@ def recognize_with_paddle(img: Image.Image) -> Tuple[str, float]:
     conf = float(sum(c for _, _, c in pieces) / len(pieces))
 
     numeric = extract_best_numeric_plate(joined)
-    return numeric, conf
 
+    print(f"[PaddleOCR RAW] joined={joined}")
+    print(f"[PaddleOCR CLEAN] numeric={numeric}")
+
+    return numeric, conf
 
 def run_alpr(img_np: np.ndarray, vehicles: List[VehicleDetection], detector_name: str, ocr_name: str) -> dict:
     base_full = Image.fromarray(img_np).convert("RGB")
     base_full = resize_if_needed(base_full, FULL_IMAGE_MAX_SIDE)
 
-    detected_plates = run_plate_detector_on_pil(base_full, detector_name, ocr_name)
+    image_used, detected_plates, used_angle = detect_plate_with_fallback_rotations(
+        base_full,
+        detector_name,
+        ocr_name,
+    )
 
     if not detected_plates:
         return {
@@ -858,12 +937,44 @@ def run_alpr(img_np: np.ndarray, vehicles: List[VehicleDetection], detector_name
             "plates": [],
         }
 
-    img_w, img_h = base_full.size
+    img_w, img_h = image_used.size
     x1, y1, x2, y2 = expand_local_plate_bbox(bbox, img_w, img_h)
-    plate_crop = base_full.crop((x1, y1, x2, y2))
-    number_band = crop_number_band(plate_crop)
+    plate_crop = image_used.crop((x1, y1, x2, y2))
 
-    text, conf = recognize_with_paddle(number_band)
+    candidates = []
+
+    for mode in ("tight", "mid", "low"):
+        band = crop_number_band(plate_crop, mode=mode)
+        text, conf = recognize_with_paddle(band)
+
+        cleaned_digits = extract_best_numeric_plate(text)
+        score = score_numeric_candidate(cleaned_digits, conf)
+
+        print(f"[OCR BAND] mode={mode} raw={text} digits={cleaned_digits} conf={conf:.4f} score={score:.4f}")
+
+        if cleaned_digits:
+            candidates.append(
+                {
+                    "text": cleaned_digits,
+                    "confidence": conf,
+                    "score": score,
+                }
+            )
+
+    if not candidates:
+        return {
+            "model": {
+                "detector_model": detector_name,
+                "ocr_model": "paddleocr_fast",
+            },
+            "plates": [],
+        }
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    best_candidate = candidates[0]
+
+    text = best_candidate["text"]
+    conf = best_candidate["confidence"]
 
     if not text or len(text) < MIN_PLATE_TEXT_LEN:
         return {
@@ -884,6 +995,9 @@ def run_alpr(img_np: np.ndarray, vehicles: List[VehicleDetection], detector_name
         }
     ]
 
+    if used_angle != 0.0:
+        print(f"[ALPR] OCR came from rotated fallback angle={used_angle}")
+
     return {
         "model": {
             "detector_model": detector_name,
@@ -891,7 +1005,6 @@ def run_alpr(img_np: np.ndarray, vehicles: List[VehicleDetection], detector_name
         },
         "plates": plates,
     }
-
 
 def normalize_plate_text(plates: List[dict]) -> List[str]:
     cleaned: List[str] = []
@@ -1501,7 +1614,7 @@ async def detect_all(
         raise HTTPException(status_code=400, detail="File must be an image.")
 
     detector_name = detector_model or DETECTOR_MODELS[0]
-    ocr_name = ocr_model or OCR_MODELS[0]  # kept for compatibility
+    ocr_name = ocr_model or OCR_MODELS[0]
 
     data = await file.read()
     if not data:
