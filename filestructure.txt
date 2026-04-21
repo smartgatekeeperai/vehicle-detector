@@ -1,13 +1,20 @@
 |-- .env
 |-- .gitignore
+|-- ai_plate.py
+|-- ai_vehicle.py
 |-- dbo.sql
 |-- howtorunlocal.txt
 |-- LICENSE
 |-- main.py
 |-- README.md
 |-- requirements.txt
+|-- services.py
 |-- start.py
+|-- storage
 |-- yolov8n.pt
 |-- yolov8x.pt
 |-- __pycache__
+    |-- ai_plate.cpython-310.pyc
+    |-- ai_vehicle.cpython-310.pyc
     |-- main.cpython-310.pyc
+    |-- services.cpython-310.pyc

@@ -1,157 +1,56 @@
 import io
+import json
 import os
 import time
-import json
-import socket
-import tempfile
-import traceback
-from functools import lru_cache
-from typing import List, Optional, Literal, get_args, Any, Dict, Tuple
+from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------
-# Load .env (current dir + parent, to catch root .env)
+# Load .env FIRST, before importing modules that read env
 # ---------------------------------------------------------
 load_dotenv()
 parent_env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
 if os.path.exists(parent_env_path):
     load_dotenv(parent_env_path, override=False)
 
-import numpy as np
-import asyncpg
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
-from PIL import Image, ImageOps
+from fastapi.responses import FileResponse, JSONResponse, Response
+from PIL import Image, ImageDraw, ImageFont
 
-from ultralytics import YOLO
-import torch
+from ai_plate import DETECTOR_MODELS, OCR_MODELS, DetectorName, OcrName, load_image_to_numpy, run_alpr
+from ai_vehicle import DEVICE, YOLO_MODEL_PATH, run_yolo_vehicles
+from services import (
+    IMAGE_SAVE_DIR,
+    SERIAL_ENABLED,
+    SERIAL_PORT,
+    STREAM_ONLINE_WINDOW_MS,
+    STREAM_STALE_REMOVE_MS,
+    active_streams,
+    build_light_serial_command,
+    build_stream_list,
+    cleanup_streams,
+    close_db,
+    compute_gate_state_fast,
+    get_light_by_stream_id,
+    get_light_command_from_gate,
+    init_db,
+    latest_frames,
+    now_ms,
+    pusher_client,
+    pusher_mode,
+    pusher_reason,
+    save_image_bytes,
+    send_serial_command_to_pico,
+    touch_stream,
+    update_gate_state_and_push,
+)
 
-from pusher import Pusher
-
-from fast_alpr import ALPR
-from fast_alpr.default_detector import PlateDetectorModel
-from fast_alpr.default_ocr import OcrModel
-
-from paddleocr import PaddleOCR
-
-# =========================================================
-# OPTIONAL SERIAL (PC -> Pico)
-# =========================================================
-try:
-    import serial  # pip install pyserial
-except Exception:
-    serial = None
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8x.pt")
-
-VEHICLE_CLASS_IDS = {2, 3, 5, 7}
-
-VEHICLE_CLASS_NAMES = {
-    2: "car",
-    3: "motorcycle",
-    5: "bus",
-    7: "truck",
-    21: "pickup",
-    22: "utility vehicle",
-    23: "van",
-    24: "jeep",
-    25: "suv",
-}
-
-CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.5"))
-IOU_THRESHOLD = float(os.getenv("IOU_THRESHOLD", "0.5"))
-HOLD_SECONDS = float(os.getenv("HOLD_SECONDS", "0.7"))
-
-PASS_LOCK_MS = int(os.getenv("PASS_LOCK_MS", "10000"))
-CLEAR_AFTER_MS = int(os.getenv("CLEAR_AFTER_MS", "5000"))
-
-LOG_WINDOW_MS = int(os.getenv("LOG_WINDOW_MS", str(5 * 60 * 1000)))
-
-PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
-
-STREAM_ONLINE_WINDOW_MS = int(os.getenv("STREAM_ONLINE_WINDOW_MS", "5000"))
-STREAM_STALE_REMOVE_MS = int(os.getenv("STREAM_STALE_REMOVE_MS", "60000"))
-
-FULL_IMAGE_MAX_SIDE = int(os.getenv("FULL_IMAGE_MAX_SIDE", "1600"))
-
-VEHICLE_CROP_PADDING_X = float(os.getenv("VEHICLE_CROP_PADDING_X", "0.16"))
-VEHICLE_CROP_PADDING_Y = float(os.getenv("VEHICLE_CROP_PADDING_Y", "0.20"))
-
-PLATE_REFINEMENT_PADDING_LEFT = float(os.getenv("PLATE_REFINEMENT_PADDING_LEFT", "0.06"))
-PLATE_REFINEMENT_PADDING_RIGHT = float(os.getenv("PLATE_REFINEMENT_PADDING_RIGHT", "0.10"))
-PLATE_REFINEMENT_PADDING_TOP = float(os.getenv("PLATE_REFINEMENT_PADDING_TOP", "0.08"))
-PLATE_REFINEMENT_PADDING_BOTTOM = float(os.getenv("PLATE_REFINEMENT_PADDING_BOTTOM", "0.08"))
-
-PLATE_NUMBER_BAND_TOP = float(os.getenv("PLATE_NUMBER_BAND_TOP", "0.33"))
-PLATE_NUMBER_BAND_BOTTOM = float(os.getenv("PLATE_NUMBER_BAND_BOTTOM", "0.82"))
-PLATE_NUMBER_BAND_LEFT = float(os.getenv("PLATE_NUMBER_BAND_LEFT", "0.01"))
-PLATE_NUMBER_BAND_RIGHT = float(os.getenv("PLATE_NUMBER_BAND_RIGHT", "0.99"))
-
-MIN_PLATE_TEXT_LEN = int(os.getenv("MIN_PLATE_TEXT_LEN", "6"))
-
-PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "en")
-
-
-# =========================================================
-# SERIAL CONFIG (PICO CONTROL)
-# =========================================================
-SERIAL_ENABLED = os.getenv("SERIAL_ENABLED", "false").lower() == "true"
-SERIAL_PORT = os.getenv("SERIAL_PORT", "COM5")
-SERIAL_BAUDRATE = int(os.getenv("SERIAL_BAUDRATE", "115200"))
-SERIAL_TIMEOUT = float(os.getenv("SERIAL_TIMEOUT", "1"))
-SERIAL_OPEN_DELAY = float(os.getenv("SERIAL_OPEN_DELAY", "2.0"))
-
-
-# =========================================================
-# FASTALPR CONFIG
-# =========================================================
-DETECTOR_MODELS: List[PlateDetectorModel] = list(get_args(PlateDetectorModel))
-OCR_MODELS: List[OcrModel] = list(get_args(OcrModel))
-
-if "cct-xs-v2-global-model" in OCR_MODELS:
-    OCR_MODELS.remove("cct-xs-v2-global-model")
-    OCR_MODELS.insert(0, "cct-xs-v2-global-model")
-elif "cct-s-v2-global-model" in OCR_MODELS:
-    OCR_MODELS.remove("cct-s-v2-global-model")
-    OCR_MODELS.insert(0, "cct-s-v2-global-model")
-
-DetectorName = Literal[tuple(DETECTOR_MODELS)]  # type: ignore
-OcrName = Literal[tuple(OCR_MODELS)]  # type: ignore
-
-
-@lru_cache(maxsize=8)
-def get_alpr(detector_model: str, ocr_model: str) -> ALPR:
-    if detector_model not in DETECTOR_MODELS:
-        raise ValueError(f"Unknown detector_model {detector_model}")
-    if ocr_model not in OCR_MODELS:
-        raise ValueError(f"Unknown ocr_model {ocr_model}")
-    return ALPR(detector_model=detector_model, ocr_model=ocr_model)
-
-
-@lru_cache(maxsize=1)
-def get_paddle_ocr() -> PaddleOCR:
-    use_gpu = torch.cuda.is_available()
-    return PaddleOCR(
-        use_angle_cls=False,
-        lang=PADDLEOCR_LANG,
-        show_log=False,
-        use_gpu=use_gpu,
-    )
-
-
-# =========================================================
-# APP
-# =========================================================
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8 + FastALPR + Fast PaddleOCR",
-    version="1.4.3",
+    version="2.3.0",
 )
 
 app.add_middleware(
@@ -163,1270 +62,149 @@ app.add_middleware(
 )
 
 
-# =========================================================
-# DEVICE + YOLO MODEL
-# =========================================================
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[INIT] Loading YOLO model on device: {DEVICE}")
-yolo_model = YOLO(YOLO_MODEL_PATH)
-yolo_model.to(DEVICE)
+def _load_font(size: int = 24):
+    try:
+        return ImageFont.truetype("arial.ttf", size)
+    except Exception:
+        try:
+            return ImageFont.truetype("DejaVuSans.ttf", size)
+        except Exception:
+            return ImageFont.load_default()
 
 
-# =========================================================
-# PER-STREAM GATE STATE
-# =========================================================
-def create_empty_gate_state(stream_id: str) -> Dict[str, Any]:
-    return {
-        "stream_id": stream_id,
-        "vehicleFound": False,
-        "plate": None,
-        "driver": None,
-        "vehicle": None,
-        "lastUpdate": None,
-    }
+def _draw_label(draw: ImageDraw.ImageDraw, x: int, y: int, text: str, font):
+    if not text:
+        return
+
+    try:
+        bbox = draw.textbbox((x, y), text, font=font)
+        tw = bbox[2] - bbox[0]
+        th = bbox[3] - bbox[1]
+    except Exception:
+        tw = max(40, len(text) * 8)
+        th = 18
+
+    pad_x = 6
+    pad_y = 4
+
+    rx1 = x
+    ry1 = max(0, y - th - (pad_y * 2) - 4)
+    rx2 = x + tw + (pad_x * 2)
+    ry2 = ry1 + th + (pad_y * 2)
+
+    draw.rectangle([rx1, ry1, rx2, ry2], fill=(0, 0, 0))
+    draw.text((rx1 + pad_x, ry1 + pad_y), text, fill=(255, 255, 255), font=font)
 
 
-gate_states_by_stream: Dict[str, Dict[str, Any]] = {}
-registered_gate_state_by_stream: Dict[str, Optional[Dict[str, Any]]] = {}
-registered_gate_ts_by_stream: Dict[str, int] = {}
-
-last_vehicle_detections_by_stream: Dict[str, List["VehicleDetection"]] = {}
-last_vehicle_ts_by_stream: Dict[str, float] = {}
-
-
-def get_gate_state_for_stream(stream_id: str) -> Dict[str, Any]:
-    if stream_id not in gate_states_by_stream:
-        gate_states_by_stream[stream_id] = create_empty_gate_state(stream_id)
-    return gate_states_by_stream[stream_id]
+def _safe_bbox_coords(bbox: dict, img_w: int, img_h: int):
+    x1 = int(max(0, min(bbox.get("x1", 0), img_w - 1)))
+    y1 = int(max(0, min(bbox.get("y1", 0), img_h - 1)))
+    x2 = int(max(x1 + 1, min(bbox.get("x2", 0), img_w)))
+    y2 = int(max(y1 + 1, min(bbox.get("y2", 0), img_h)))
+    return x1, y1, x2, y2
 
 
-def set_gate_state_for_stream(stream_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = {
-        "stream_id": stream_id,
-        "vehicleFound": bool(state.get("vehicleFound")),
-        "plate": state.get("plate"),
-        "driver": state.get("driver"),
-        "vehicle": state.get("vehicle"),
-        "lastUpdate": state.get("lastUpdate"),
-    }
-    gate_states_by_stream[stream_id] = normalized
-    return normalized
+def build_annotated_preview_bytes(
+    original_image_bytes: bytes,
+    plates: list,
+    vehicles: list,
+) -> bytes:
+    img = Image.open(io.BytesIO(original_image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    font = _load_font(24)
+
+    img_w, img_h = img.size
+
+    for vehicle in vehicles or []:
+        vb = vehicle.get("bbox") if isinstance(vehicle, dict) else None
+        if not vb:
+            continue
+
+        x1 = int(vb.get("x1", 0))
+        y1 = int(vb.get("y1", 0))
+        x2 = int(vb.get("x2", 0))
+        y2 = int(vb.get("y2", 0))
+
+        x1 = max(0, min(x1, img_w - 1))
+        y1 = max(0, min(y1, img_h - 1))
+        x2 = max(x1 + 1, min(x2, img_w))
+        y2 = max(y1 + 1, min(y2, img_h))
+
+        draw.rectangle([x1, y1, x2, y2], outline=(255, 215, 0), width=4)
+
+        label = vehicle.get("class_name") or "vehicle"
+        conf = vehicle.get("confidence")
+        if conf is not None:
+            try:
+                label = f"{label} {float(conf):.2f}"
+            except Exception:
+                pass
+
+        _draw_label(draw, x1, y1, label, font)
+
+    for plate in plates or []:
+        bbox = plate.get("bbox")
+        ocr = plate.get("ocr") or {}
+        text = ocr.get("text") or ""
+
+        if not bbox:
+            continue
+
+        x1, y1, x2, y2 = _safe_bbox_coords(bbox, img_w, img_h)
+        draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=5)
+        _draw_label(draw, x1, y1, text, font)
+
+    out = io.BytesIO()
+    img.save(out, format="JPEG", quality=85)
+    return out.getvalue()
 
 
-def clear_registered_lock_for_stream(stream_id: str) -> None:
-    registered_gate_state_by_stream[stream_id] = None
-    registered_gate_ts_by_stream[stream_id] = 0
+async def finalize_detect_side_effects(
+    sid: str,
+    original_image_bytes: bytes,
+    vehicles_payload: list,
+    plates: list,
+):
+    """
+    Non-critical path:
+    - build/save preview image
+    - DB/log state update
+    - pusher update through services
+    """
+    image_preview_filename = None
 
-
-# =========================================================
-# LATEST FRAMES + ACTIVE STREAMS
-# =========================================================
-latest_frames: Dict[str, Dict[str, Any]] = {}
-active_streams: Dict[str, Dict[str, Any]] = {}
-
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-def touch_stream(stream_id: str, ts: Optional[int] = None) -> Dict[str, Any]:
-    sid = (stream_id or "").strip() or "mobile-1"
-    ts_ms = ts if ts is not None else now_ms()
-
-    existing = active_streams.get(sid) or {}
-    record = {
-        "stream_id": sid,
-        "last_seen": ts_ms,
-        "first_seen": existing.get("first_seen", ts_ms),
-    }
-    active_streams[sid] = record
-    return record
-
-
-def cleanup_streams(current_ts: Optional[int] = None) -> None:
-    ts_ms = current_ts if current_ts is not None else now_ms()
-
-    stale_stream_ids = [
-        sid
-        for sid, info in active_streams.items()
-        if (ts_ms - int(info.get("last_seen", 0))) > STREAM_STALE_REMOVE_MS
-    ]
-    for sid in stale_stream_ids:
-        active_streams.pop(sid, None)
-
-    stale_frame_ids = [
-        sid
-        for sid, info in latest_frames.items()
-        if (ts_ms - int(info.get("ts", 0))) > STREAM_STALE_REMOVE_MS
-    ]
-    for sid in stale_frame_ids:
-        latest_frames.pop(sid, None)
-
-    stale_state_ids = [
-        sid
-        for sid, state in gate_states_by_stream.items()
-        if state.get("lastUpdate") and (ts_ms - int(state["lastUpdate"])) > STREAM_STALE_REMOVE_MS
-    ]
-    for sid in stale_state_ids:
-        gate_states_by_stream.pop(sid, None)
-        registered_gate_state_by_stream.pop(sid, None)
-        registered_gate_ts_by_stream.pop(sid, None)
-        last_vehicle_detections_by_stream.pop(sid, None)
-        last_vehicle_ts_by_stream.pop(sid, None)
-
-
-def build_stream_list(current_ts: Optional[int] = None) -> List[Dict[str, Any]]:
-    ts_ms = current_ts if current_ts is not None else now_ms()
-    cleanup_streams(ts_ms)
-
-    items: List[Dict[str, Any]] = []
-    for sid, info in active_streams.items():
-        last_seen = int(info.get("last_seen", 0))
-        items.append(
-            {
-                "stream_id": sid,
-                "last_seen": last_seen,
-                "is_online": (ts_ms - last_seen) <= STREAM_ONLINE_WINDOW_MS,
-                "has_frame": sid in latest_frames,
-            }
+    try:
+        preview_bytes = build_annotated_preview_bytes(
+            original_image_bytes=original_image_bytes,
+            plates=plates,
+            vehicles=vehicles_payload,
         )
+        image_preview_filename = save_image_bytes(preview_bytes, sid, ext=".jpg")
+        print(f"[/detect bg] image_preview_filename={image_preview_filename}")
+    except Exception as e:
+        print(f"[/detect bg] preview annotation/save failed: {e}")
 
-    items.sort(key=lambda x: x["last_seen"], reverse=True)
-    return items
-
-
-# =========================================================
-# DB (PostgreSQL)
-# =========================================================
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    DB_USER = os.getenv("DB_USER", "")
-    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
-    DB_HOST = os.getenv("DB_HOST", "localhost")
-    DB_PORT = os.getenv("DB_PORT", "5432")
-    DB_NAME = os.getenv("DB_NAME", "")
-
-    if DB_USER and DB_NAME:
-        DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
-        print("[DB] Constructed DATABASE_URL from DB_* env vars")
-    else:
-        print("[DB] Missing DB_USER or DB_NAME; cannot construct DATABASE_URL.")
-
-if DATABASE_URL:
-    print("[DB] Using DATABASE_URL")
-else:
-    print("[DB] DATABASE_URL is not set. DB queries will fail.")
+    try:
+        await update_gate_state_and_push(
+            vehicles_payload,
+            plates,
+            camera_source=sid,
+            image_preview_filename=image_preview_filename,
+        )
+    except Exception as e:
+        print(f"[/detect bg] update_gate_state_and_push failed: {e}")
 
 
 @app.on_event("startup")
 async def startup():
-    if not DATABASE_URL:
-        print("[WARN] DATABASE_URL is not set; DB queries will fail.")
-        app.state.db_pool = None
-        return
-
-    try:
-        app.state.db_pool = await asyncpg.create_pool(DATABASE_URL)
-        print("[INIT] asyncpg pool created")
-    except Exception as e:
-        print("[DB] Failed to create pool:", e)
-        app.state.db_pool = None
+    await init_db()
 
 
 @app.on_event("shutdown")
 async def shutdown():
-    pool = getattr(app.state, "db_pool", None)
-    if pool is not None:
-        await pool.close()
-        print("[DB] Pool closed")
+    await close_db()
 
 
-async def db_query(sql: str, params: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
-    params = params or []
-    pool = getattr(app.state, "db_pool", None)
-    if pool is None:
-        raise RuntimeError("DB pool is not initialized.")
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
-        return [dict(r) for r in rows]
-
-
-async def db_execute(sql: str, params: Optional[List[Any]] = None) -> None:
-    params = params or []
-    pool = getattr(app.state, "db_pool", None)
-    if pool is None:
-        raise RuntimeError("DB pool is not initialized.")
-    async with pool.acquire() as conn:
-        await conn.execute(sql, *params)
-
-
-async def get_light_by_stream_id(stream_id: str) -> Optional[Dict[str, Any]]:
-    if not stream_id:
-        return None
-
-    sql = """
-        SELECT
-            "Name",
-            "SecretKey",
-            "CameraStreamId"
-        FROM dbo."Lights"
-        WHERE "Active" = true
-          AND "CameraStreamId" = $1
-        ORDER BY "Name" ASC
-    """
-    rows = await db_query(sql, [stream_id])
-    if not rows:
-        return None
-
-    if len(rows) > 1:
-        print(f"[LIGHT WARNING] Multiple active Lights rows found for stream_id='{stream_id}': {rows}")
-
-    return rows[0]
-
-
-# =========================================================
-# PUSHER CLIENT
-# =========================================================
-PUSHER_APP_ID = (os.getenv("PUSHER_APP_ID") or "").strip()
-PUSHER_KEY = (os.getenv("PUSHER_KEY") or "").strip()
-PUSHER_SECRET = (os.getenv("PUSHER_SECRET") or "").strip()
-PUSHER_CLUSTER = (os.getenv("PUSHER_CLUSTER") or "ap1").strip()
-PUSHER_HOST = (os.getenv("PUSHER_HOST") or "").strip()
-PUSHER_PORT = int((os.getenv("PUSHER_PORT") or "6001").strip())
-
-USE_LOCAL_PUSHER = (os.getenv("USE_LOCAL_PUSHER") or "false").strip().lower() == "true"
-PUSHER_RETRY_SECONDS = int((os.getenv("PUSHER_RETRY_SECONDS") or "10").strip())
-PUSHER_CONNECT_TIMEOUT = float((os.getenv("PUSHER_CONNECT_TIMEOUT") or "0.8").strip())
-
-IS_HUGGING_FACE = bool(os.getenv("SPACE_ID"))
-IS_VERCEL = os.getenv("VERCEL") == "1"
-IS_PRODUCTION = (os.getenv("NODE_ENV") or "").strip().lower() == "production"
-
-USE_LOCAL_PUSHER_EFFECTIVE = USE_LOCAL_PUSHER and not IS_HUGGING_FACE and not IS_VERCEL and not IS_PRODUCTION
-
-
-def can_connect_socket(host: str, port: int, timeout: float = 0.8) -> bool:
-    if not host or not port:
-        return False
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
-    try:
-        sock.connect((host, port))
-        return True
-    except Exception:
-        return False
-    finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
-
-
-class DummyPusher:
-    def __init__(self, reason: str = "disabled"):
-        self.reason = reason
-        self.last_error = None
-        self.disabled_until = 0.0
-
-    def trigger(self, channel, event, data):
-        return None
-
-
-class SafePusher:
-    def __init__(self, client, mode: str, retry_seconds: int = 10):
-        self.client = client
-        self.mode = mode
-        self.retry_seconds = max(1, retry_seconds)
-        self.disabled_until = 0.0
-        self.last_error = None
-
-    def trigger(self, channel, event, data):
-        now = time.time()
-
-        if now < self.disabled_until:
-            return None
-
-        try:
-            return self.client.trigger(channel, event, data)
-        except Exception as e:
-            self.last_error = str(e)
-            self.disabled_until = now + self.retry_seconds
-            print(
-                f"[Pusher] trigger failed in {self.mode} mode; "
-                f"muted for {self.retry_seconds}s. Error: {e}"
-            )
-            return None
-
-
-pusher_mode = "dummy"
-pusher_reason = ""
-pusher_client: Any = DummyPusher("uninitialized")
-
-print(
-    "[Pusher] env values:",
-    "APP_ID=", repr(PUSHER_APP_ID),
-    "KEY=", repr(PUSHER_KEY),
-    "SECRET set=", bool(PUSHER_SECRET),
-    "CLUSTER=", repr(PUSHER_CLUSTER),
-    "HOST=", repr(PUSHER_HOST),
-    "PORT=", repr(PUSHER_PORT),
-    "USE_LOCAL_PUSHER=", USE_LOCAL_PUSHER,
-    "USE_LOCAL_PUSHER_EFFECTIVE=", USE_LOCAL_PUSHER_EFFECTIVE,
-    "IS_HUGGING_FACE=", IS_HUGGING_FACE,
-    "IS_VERCEL=", IS_VERCEL,
-    "IS_PRODUCTION=", IS_PRODUCTION,
-)
-
-if not PUSHER_APP_ID:
-    pusher_mode = "dummy"
-    pusher_reason = "missing PUSHER_APP_ID"
-    print(f"[Pusher] Dummy mode: {pusher_reason}")
-    pusher_client = DummyPusher(pusher_reason)
-else:
-    if USE_LOCAL_PUSHER_EFFECTIVE and PUSHER_HOST:
-        local_reachable = can_connect_socket(
-            PUSHER_HOST,
-            PUSHER_PORT,
-            timeout=PUSHER_CONNECT_TIMEOUT,
-        )
-
-        if local_reachable:
-            try:
-                local_kwargs: Dict[str, Any] = {
-                    "app_id": PUSHER_APP_ID,
-                    "key": PUSHER_KEY,
-                    "secret": PUSHER_SECRET,
-                    "host": PUSHER_HOST,
-                    "port": PUSHER_PORT,
-                    "ssl": False,
-                }
-                raw_local_client = Pusher(**local_kwargs)
-                pusher_client = SafePusher(
-                    raw_local_client,
-                    mode="local",
-                    retry_seconds=PUSHER_RETRY_SECONDS,
-                )
-                pusher_mode = "local"
-                pusher_reason = f"connected to local server at {PUSHER_HOST}:{PUSHER_PORT}"
-                print(f"[Pusher] Using LOCAL server at {PUSHER_HOST}:{PUSHER_PORT}")
-            except Exception as e:
-                pusher_mode = "dummy"
-                pusher_reason = f"local init failed: {e}"
-                pusher_client = DummyPusher(pusher_reason)
-                print(f"[Pusher] Dummy mode: {pusher_reason}")
-        else:
-            pusher_mode = "dummy"
-            pusher_reason = f"local server not reachable at {PUSHER_HOST}:{PUSHER_PORT}"
-            pusher_client = DummyPusher(pusher_reason)
-            print(f"[Pusher] Dummy mode: {pusher_reason}")
-    else:
-        try:
-            cloud_kwargs: Dict[str, Any] = {
-                "app_id": PUSHER_APP_ID,
-                "key": PUSHER_KEY,
-                "secret": PUSHER_SECRET,
-                "cluster": PUSHER_CLUSTER,
-                "ssl": True,
-            }
-            raw_cloud_client = Pusher(**cloud_kwargs)
-            pusher_client = SafePusher(
-                raw_cloud_client,
-                mode="cloud",
-                retry_seconds=PUSHER_RETRY_SECONDS,
-            )
-            pusher_mode = "cloud"
-            pusher_reason = f"using cloud cluster={PUSHER_CLUSTER}"
-            print(f"[Pusher] Using CLOUD (cluster={PUSHER_CLUSTER}, TLS=True)")
-        except Exception as e:
-            pusher_mode = "dummy"
-            pusher_reason = f"cloud init failed: {e}"
-            pusher_client = DummyPusher(pusher_reason)
-            print(f"[Pusher] Dummy mode: {pusher_reason}")
-
-print(f"[INIT] Realtime mode = {pusher_mode} ({pusher_reason})")
-
-
-# =========================================================
-# Pydantic Models
-# =========================================================
-class VehicleBBox(BaseModel):
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-    width: float
-    height: float
-    cx: float
-    cy: float
-    nx: float
-    ny: float
-    nwidth: float
-    nheight: float
-
-
-class VehicleDetection(BaseModel):
-    bbox: VehicleBBox
-    confidence: float
-    class_id: int
-    class_name: str
-
-
-# =========================================================
-# HELPERS
-# =========================================================
-def load_image_to_numpy(data: bytes) -> np.ndarray:
-    try:
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image file: {e}")
-    return np.array(img)
-
-
-def build_vehicle_bbox(x1: float, y1: float, x2: float, y2: float, image_w: int, image_h: int) -> VehicleBBox:
-    width = x2 - x1
-    height = y2 - y1
-    cx = x1 + width / 2.0
-    cy = y1 + height / 2.0
-
-    nx = x1 / image_w
-    ny = y1 / image_h
-    nwidth = width / image_w
-    nheight = height / image_h
-
-    return VehicleBBox(
-        x1=x1,
-        y1=y1,
-        x2=x2,
-        y2=y2,
-        width=width,
-        height=height,
-        cx=cx,
-        cy=cy,
-        nx=nx,
-        ny=ny,
-        nwidth=nwidth,
-        nheight=nheight,
-    )
-
-
-def resize_if_needed(img: Image.Image, max_side: int) -> Image.Image:
-    w, h = img.size
-    longest = max(w, h)
-    if longest <= max_side:
-        return img
-    scale = max_side / float(longest)
-    return img.resize(
-        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
-        Image.LANCZOS,
-    )
-
-
-def pad_image_horizontal(
-    img: Image.Image,
-    left_ratio: float = 0.08,
-    right_ratio: float = 0.16,
-    top_ratio: float = 0.06,
-    bottom_ratio: float = 0.06,
-    fill=(255, 255, 255),
-) -> Image.Image:
-    w, h = img.size
-    left = max(1, int(round(w * left_ratio)))
-    right = max(1, int(round(w * right_ratio)))
-    top = max(1, int(round(h * top_ratio)))
-    bottom = max(1, int(round(h * bottom_ratio)))
-    return ImageOps.expand(img, border=(left, top, right, bottom), fill=fill)
-
-
-def rotate_image_expand(img: Image.Image, angle_deg: float) -> Image.Image:
-    return img.rotate(angle_deg, expand=True, resample=Image.BICUBIC, fillcolor=(255, 255, 255))
-
-
-def serialize_alpr_result(result) -> dict:
-    ocr_obj = getattr(result, "ocr", None)
-    ocr = None
-    if ocr_obj is not None:
-        raw_conf = getattr(ocr_obj, "confidence", 0.0)
-        if isinstance(raw_conf, (list, tuple)):
-            conf_val = float(sum(raw_conf) / len(raw_conf)) if raw_conf else 0.0
-        else:
-            conf_val = float(raw_conf or 0.0)
-
-        ocr = {
-            "text": getattr(ocr_obj, "text", None),
-            "confidence": conf_val,
-        }
-
-    bbox = None
-    detection = getattr(result, "detection", None)
-    if detection is not None:
-        bb = getattr(detection, "bounding_box", None)
-        if bb is not None:
-            bbox = {
-                "x1": int(getattr(bb, "x1", 0)),
-                "y1": int(getattr(bb, "y1", 0)),
-                "x2": int(getattr(bb, "x2", 0)),
-                "y2": int(getattr(bb, "y2", 0)),
-            }
-
-    return {"ocr": ocr, "bbox": bbox}
-
-
-def run_plate_detector_on_pil(pil_img: Image.Image, detector_name: str, ocr_name: str) -> List[dict]:
-    try:
-        alpr = get_alpr(detector_name, ocr_name)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            temp_path = tmp.name
-
-        pil_img.save(temp_path, format="PNG", optimize=False)
-        results = alpr.predict(temp_path)
-    except Exception as e:
-        print("[ALPR] Full traceback:")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"ALPR error: {e}")
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
-
-    return [serialize_alpr_result(r) for r in results] if results else []
-
-
-def detect_plate_with_fallback_rotations(
-    base_img: Image.Image,
-    detector_name: str,
-    ocr_name: str,
-) -> Tuple[Image.Image, List[dict], float]:
-    detections = run_plate_detector_on_pil(base_img, detector_name, ocr_name)
-    if detections:
-        return base_img, detections, 0.0
-
-    for angle in (-25, -15, 15, 25):
-        rotated = rotate_image_expand(base_img, angle)
-        rotated_detections = run_plate_detector_on_pil(rotated, detector_name, ocr_name)
-        if rotated_detections:
-            print(f"[ALPR] fallback rotated detection success angle={angle}")
-            return rotated, rotated_detections, float(angle)
-
-    return base_img, [], 0.0
-
-
-def clamp_box(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> Tuple[int, int, int, int]:
-    x1 = max(0, min(x1, w - 1))
-    y1 = max(0, min(y1, h - 1))
-    x2 = max(x1 + 1, min(x2, w))
-    y2 = max(y1 + 1, min(y2, h))
-    return x1, y1, x2, y2
-
-
-def expand_local_plate_bbox(
-    bbox: Dict[str, int],
-    img_w: int,
-    img_h: int,
-    pad_left_ratio: float = PLATE_REFINEMENT_PADDING_LEFT,
-    pad_right_ratio: float = PLATE_REFINEMENT_PADDING_RIGHT,
-    pad_top_ratio: float = PLATE_REFINEMENT_PADDING_TOP,
-    pad_bottom_ratio: float = PLATE_REFINEMENT_PADDING_BOTTOM,
-) -> Tuple[int, int, int, int]:
-    x1 = int(bbox.get("x1", 0))
-    y1 = int(bbox.get("y1", 0))
-    x2 = int(bbox.get("x2", 0))
-    y2 = int(bbox.get("y2", 0))
-
-    width = max(1, x2 - x1)
-    height = max(1, y2 - y1)
-
-    pad_left = int(round(width * pad_left_ratio))
-    pad_right = int(round(width * pad_right_ratio))
-    pad_top = int(round(height * pad_top_ratio))
-    pad_bottom = int(round(height * pad_bottom_ratio))
-
-    return clamp_box(
-        x1 - pad_left,
-        y1 - pad_top,
-        x2 + pad_right,
-        y2 + pad_bottom,
-        img_w,
-        img_h,
-    )
-
-def crop_number_band(plate_img: Image.Image, mode: str = "tight") -> Image.Image:
-    """
-    Crop only the large digit row.
-    Different temporary plate layouts need slightly different vertical windows.
-    """
-    w, h = plate_img.size
-
-    if mode == "tight":
-        # focus mostly on the large digits only
-        top = 0.22
-        bottom = 0.62
-    elif mode == "mid":
-        # include a bit more lower part of digits
-        top = 0.24
-        bottom = 0.68
-    elif mode == "low":
-        # fallback for slanted plates where digits sit lower
-        top = 0.28
-        bottom = 0.72
-    else:
-        top = PLATE_NUMBER_BAND_TOP
-        bottom = PLATE_NUMBER_BAND_BOTTOM
-
-    x1 = int(round(w * 0.02))
-    x2 = int(round(w * 0.98))
-    y1 = int(round(h * top))
-    y2 = int(round(h * bottom))
-
-    x1 = max(0, min(x1, w - 1))
-    x2 = max(x1 + 1, min(x2, w))
-    y1 = max(0, min(y1, h - 1))
-    y2 = max(y1 + 1, min(y2, h))
-
-    band = plate_img.crop((x1, y1, x2, y2))
-    band = pad_image_horizontal(
-        band,
-        left_ratio=0.02,
-        right_ratio=0.03,
-        top_ratio=0.04,
-        bottom_ratio=0.04,
-    )
-    return band
-
-def clean_plate_text(text: Optional[str]) -> str:
-    if not text:
-        return ""
-    return "".join(ch for ch in text.upper() if ch.isalnum())
-
-
-def extract_best_numeric_plate(text: str) -> str:
-    cleaned = clean_plate_text(text)
-    if not cleaned:
-        return ""
-
-    digit_runs = []
-    current = []
-
-    for ch in cleaned:
-        if ch.isdigit():
-            current.append(ch)
-        else:
-            if current:
-                digit_runs.append("".join(current))
-                current = []
-    if current:
-        digit_runs.append("".join(current))
-
-    if not digit_runs:
-        return cleaned
-
-    digit_runs.sort(key=len, reverse=True)
-    best = digit_runs[0]
-
-    if len(best) == 11 and best[1] == "0":
-        best = best[1:]
-
-    return best
-
-def score_numeric_candidate(text: str, conf: float) -> float:
-    cleaned = clean_plate_text(text)
-    if not cleaned:
-        return -9999.0
-
-    digits = "".join(ch for ch in cleaned if ch.isdigit())
-    alpha_count = sum(ch.isalpha() for ch in cleaned)
-    digit_count = len(digits)
-
-    score = float(conf)
-    score += digit_count * 0.20
-    score -= alpha_count * 0.25
-
-    if digit_count >= 8:
-        score += 0.50
-    if digit_count >= 10:
-        score += 0.80
-
-    if digit_count == 0:
-        score -= 2.0
-
-    return score
-
-def recognize_with_paddle(img: Image.Image) -> Tuple[str, float]:
-    ocr = get_paddle_ocr()
-    img_np = np.array(img.convert("RGB"))
-    try:
-        result = ocr.ocr(img_np, cls=False)
-    except Exception as e:
-        print(f"[PaddleOCR] recognize error: {e}")
-        return "", 0.0
-
-    if not result or not result[0]:
-        return "", 0.0
-
-    pieces: List[Tuple[float, str, float]] = []
-    for item in result[0]:
-        try:
-            box = item[0]
-            rec = item[1]
-            txt = str(rec[0] or "").strip()
-            conf = float(rec[1] or 0.0)
-            xs = [float(pt[0]) for pt in box]
-            left_x = min(xs) if xs else 0.0
-            if txt:
-                pieces.append((left_x, txt, conf))
-        except Exception:
-            continue
-
-    if not pieces:
-        return "", 0.0
-
-    pieces.sort(key=lambda x: x[0])
-    joined = "".join(clean_plate_text(t) for _, t, _ in pieces)
-    conf = float(sum(c for _, _, c in pieces) / len(pieces))
-
-    numeric = extract_best_numeric_plate(joined)
-
-    print(f"[PaddleOCR RAW] joined={joined}")
-    print(f"[PaddleOCR CLEAN] numeric={numeric}")
-
-    return numeric, conf
-
-def run_alpr(img_np: np.ndarray, vehicles: List[VehicleDetection], detector_name: str, ocr_name: str) -> dict:
-    base_full = Image.fromarray(img_np).convert("RGB")
-    base_full = resize_if_needed(base_full, FULL_IMAGE_MAX_SIDE)
-
-    image_used, detected_plates, used_angle = detect_plate_with_fallback_rotations(
-        base_full,
-        detector_name,
-        ocr_name,
-    )
-
-    if not detected_plates:
-        return {
-            "model": {
-                "detector_model": detector_name,
-                "ocr_model": "paddleocr_fast",
-            },
-            "plates": [],
-        }
-
-    def bbox_area(p: dict) -> int:
-        bbox = p.get("bbox") or {}
-        return max(0, int(bbox.get("x2", 0)) - int(bbox.get("x1", 0))) * max(
-            0, int(bbox.get("y2", 0)) - int(bbox.get("y1", 0))
-        )
-
-    detected_plates.sort(key=bbox_area, reverse=True)
-    best = detected_plates[0]
-    bbox = best.get("bbox")
-
-    if not bbox:
-        return {
-            "model": {
-                "detector_model": detector_name,
-                "ocr_model": "paddleocr_fast",
-            },
-            "plates": [],
-        }
-
-    img_w, img_h = image_used.size
-    x1, y1, x2, y2 = expand_local_plate_bbox(bbox, img_w, img_h)
-    plate_crop = image_used.crop((x1, y1, x2, y2))
-
-    candidates = []
-
-    for mode in ("tight", "mid", "low"):
-        band = crop_number_band(plate_crop, mode=mode)
-        text, conf = recognize_with_paddle(band)
-
-        cleaned_digits = extract_best_numeric_plate(text)
-        score = score_numeric_candidate(cleaned_digits, conf)
-
-        print(f"[OCR BAND] mode={mode} raw={text} digits={cleaned_digits} conf={conf:.4f} score={score:.4f}")
-
-        if cleaned_digits:
-            candidates.append(
-                {
-                    "text": cleaned_digits,
-                    "confidence": conf,
-                    "score": score,
-                }
-            )
-
-    if not candidates:
-        return {
-            "model": {
-                "detector_model": detector_name,
-                "ocr_model": "paddleocr_fast",
-            },
-            "plates": [],
-        }
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    best_candidate = candidates[0]
-
-    text = best_candidate["text"]
-    conf = best_candidate["confidence"]
-
-    if not text or len(text) < MIN_PLATE_TEXT_LEN:
-        return {
-            "model": {
-                "detector_model": detector_name,
-                "ocr_model": "paddleocr_fast",
-            },
-            "plates": [],
-        }
-
-    plates = [
-        {
-            "ocr": {
-                "text": text,
-                "confidence": conf,
-            },
-            "bbox": bbox,
-        }
-    ]
-
-    if used_angle != 0.0:
-        print(f"[ALPR] OCR came from rotated fallback angle={used_angle}")
-
-    return {
-        "model": {
-            "detector_model": detector_name,
-            "ocr_model": "paddleocr_fast",
-        },
-        "plates": plates,
-    }
-
-def normalize_plate_text(plates: List[dict]) -> List[str]:
-    cleaned: List[str] = []
-    for p in plates:
-        ocr = p.get("ocr") or {}
-        text = ocr.get("text")
-        if not text:
-            continue
-
-        normalized = (
-            text.replace(" ", "")
-            .replace("-", "")
-            .replace("\t", "")
-            .replace("\n", "")
-            .lower()
-        )
-        cleaned.append(normalized)
-
-    return cleaned
-
-
-def pick_best_plate_text_and_conf(plates: List[dict]) -> Tuple[Optional[str], float]:
-    best_text = None
-    best_conf = -1.0
-
-    for p in plates or []:
-        ocr = p.get("ocr") or {}
-        text = ocr.get("text")
-        conf = ocr.get("confidence")
-        if not text:
-            continue
-
-        try:
-            conf_val = float(conf) if conf is not None else 0.0
-        except Exception:
-            conf_val = 0.0
-
-        if conf_val > best_conf:
-            best_conf = conf_val
-            best_text = text
-
-    return best_text, max(0.0, best_conf)
-
-
-def to_ai_confidence_bigint(best_conf_0_1: float) -> int:
-    if best_conf_0_1 < 0:
-        best_conf_0_1 = 0.0
-    if best_conf_0_1 > 1:
-        best_conf_0_1 = 1.0
-    return int(round(best_conf_0_1 * 100))
-
-
-def build_image_preview_url(stream_id: str) -> str:
-    suffix = f"/latest-frame?stream_id={stream_id}"
-    return (PUBLIC_BASE_URL + suffix) if PUBLIC_BASE_URL else suffix
-
-
-# =========================================================
-# SERIAL HELPERS
-# =========================================================
-last_serial_command: Optional[str] = None
-
-
-def is_gate_verified_open(gate: Dict[str, Any]) -> bool:
-    return bool(
-        gate.get("vehicleFound") is True
-        and gate.get("plate")
-    )
-
-
-def get_light_command_from_gate(gate: Dict[str, Any]) -> str:
-    if is_gate_verified_open(gate):
-        return "green"
-    return "red"
-
-
-def build_light_serial_command(light: Dict[str, Any], command: str) -> Optional[str]:
-    if not light:
-        return None
-
-    name = str(light.get("Name") or "").strip()
-    secret = str(light.get("SecretKey") or "").strip()
-    cmd = str(command or "").strip().lower()
-
-    if not name or not secret or not cmd:
-        return None
-
-    return f"{name} {secret} {cmd}"
-
-
-def send_serial_command_to_pico(command_line: str) -> None:
-    global last_serial_command
-
-    if not SERIAL_ENABLED:
-        print(f"[SERIAL] Skipped (disabled): {command_line}")
-        return
-
-    if serial is None:
-        print("[SERIAL] pyserial is not installed.")
-        return
-
-    command_line = (command_line or "").strip()
-    if not command_line:
-        print("[SERIAL] Empty command line")
-        return
-
-    try:
-        with serial.Serial(SERIAL_PORT, SERIAL_BAUDRATE, timeout=SERIAL_TIMEOUT) as ser:
-            time.sleep(SERIAL_OPEN_DELAY)
-            ser.write((command_line + "\n").encode("utf-8"))
-            ser.flush()
-            last_serial_command = command_line
-            print(f"[SERIAL] Sent to Pico: {command_line}")
-    except Exception as e:
-        print(f"[SERIAL] Failed to send '{command_line}' to Pico: {e}")
-
-
-# =========================================================
-# LOGGING HELPERS
-# =========================================================
-async def get_last_log_time_ms_for_plate(plate_text: str) -> Optional[int]:
-    try:
-        sql = """
-            SELECT EXTRACT(EPOCH FROM "CreatedAt") * 1000 AS ts_ms
-            FROM dbo."Logs"
-            WHERE "PlateNumber" = $1
-            ORDER BY "CreatedAt" DESC
-            LIMIT 1
-        """
-        rows = await db_query(sql, [plate_text])
-        if not rows:
-            return None
-
-        ts_ms = rows[0].get("ts_ms")
-        return int(ts_ms) if ts_ms is not None else None
-    except Exception as e:
-        print("[Logs] Warning: get_last_log_time_ms_for_plate failed:", e)
-        return None
-
-
-async def insert_log_row(
-    plate_number: str,
-    driver_json: Optional[dict],
-    vehicle_json: Optional[dict],
-    role_type: Optional[str],
-    verification: str,
-    camera_source: str,
-    image_preview: str,
-    ai_confidence: int,
-) -> None:
-    sql = """
-        INSERT INTO dbo."Logs"
-            ("PlateNumber", "Driver", "Vehicle", "RoleType", "Verification", "CameraSource", "ImagePreview", "AIConfidence")
-        VALUES
-            ($1, $2::jsonb, $3::jsonb, $4, $5, $6, $7, $8)
-    """
-    await db_execute(sql, [
-        plate_number,
-        json.dumps(driver_json) if driver_json is not None else None,
-        json.dumps(vehicle_json) if vehicle_json is not None else None,
-        role_type,
-        verification,
-        camera_source,
-        image_preview,
-        int(ai_confidence),
-    ])
-
-
-# =========================================================
-# GATE STATE LOGIC (PER STREAM)
-# =========================================================
-def push_gate_update(stream_id: str, gate: Dict[str, Any]) -> None:
-    payload = {
-        **gate,
-        "stream_id": stream_id,
-    }
-    try:
-        print(f"[GateState] pushing gate-update: {json.dumps(payload, default=str)}")
-        pusher_client.trigger("gate-channel", "gate-update", payload)
-    except Exception as e:
-        print("[Pusher] Error sending gate-update:", e)
-
-
-async def update_gate_state_and_push(
-    vehicles: List[VehicleDetection],
-    plates: List[dict],
-    camera_source: str,
-) -> Dict[str, Any]:
-    stream_id = (camera_source or "").strip() or "mobile-1"
-    now_ts = now_ms()
-    vehicle_count = len(vehicles)
-
-    gate_state = get_gate_state_for_stream(stream_id)
-    current_registered_gate_state = registered_gate_state_by_stream.get(stream_id)
-    current_registered_ts = registered_gate_ts_by_stream.get(stream_id, 0)
-
-    print(
-        f"[GateState] update start | stream={stream_id} "
-        f"| vehicles={vehicle_count} | plates={len(plates)}"
-    )
-
-    if current_registered_gate_state is not None:
-        lock_age = now_ts - current_registered_ts
-
-        if vehicle_count > 0 and lock_age <= PASS_LOCK_MS:
-            gate_state = set_gate_state_for_stream(
-                stream_id,
-                {
-                    **current_registered_gate_state,
-                    "stream_id": stream_id,
-                    "vehicleFound": True,
-                    "lastUpdate": now_ts,
-                },
-            )
-            push_gate_update(stream_id, gate_state)
-            return gate_state
-
-        if vehicle_count == 0:
-            last_update = gate_state.get("lastUpdate") or current_registered_ts
-            if last_update and (now_ts - int(last_update) <= CLEAR_AFTER_MS):
-                push_gate_update(stream_id, gate_state)
-                return gate_state
-
-        clear_registered_lock_for_stream(stream_id)
-
-    if (not vehicles) and (not plates):
-        last_update = gate_state.get("lastUpdate")
-        if gate_state.get("vehicleFound") and last_update and (now_ts - int(last_update) <= CLEAR_AFTER_MS):
-            push_gate_update(stream_id, gate_state)
-            return gate_state
-
-        gate_state = set_gate_state_for_stream(
-            stream_id,
-            {
-                "stream_id": stream_id,
-                "vehicleFound": False,
-                "plate": None,
-                "driver": None,
-                "vehicle": None,
-                "lastUpdate": None,
-            },
-        )
-        push_gate_update(stream_id, gate_state)
-        return gate_state
-
-    if vehicles and not plates:
-        existing_plate = None
-        existing_driver = None
-        existing_vehicle = None
-
-        if current_registered_gate_state is not None:
-            lock_age = now_ts - current_registered_ts
-            if lock_age <= PASS_LOCK_MS:
-                existing_plate = current_registered_gate_state.get("plate")
-                existing_driver = current_registered_gate_state.get("driver")
-                existing_vehicle = current_registered_gate_state.get("vehicle")
-
-        gate_state = set_gate_state_for_stream(
-            stream_id,
-            {
-                "stream_id": stream_id,
-                "vehicleFound": True,
-                "plate": existing_plate,
-                "driver": existing_driver,
-                "vehicle": existing_vehicle,
-                "lastUpdate": now_ts,
-            },
-        )
-        push_gate_update(stream_id, gate_state)
-        return gate_state
-
-    cleaned_plates = normalize_plate_text(plates)
-    print(f"[GateState] stream={stream_id} cleaned_plates={cleaned_plates}")
-
-    best_plate_text, best_plate_conf = pick_best_plate_text_and_conf(plates)
-    ai_conf_bigint = to_ai_confidence_bigint(best_plate_conf)
-    image_preview = build_image_preview_url(stream_id)
-
-    if not cleaned_plates:
-        gate_state = set_gate_state_for_stream(
-            stream_id,
-            {
-                "stream_id": stream_id,
-                "vehicleFound": vehicle_count > 0,
-                "plate": None,
-                "driver": None,
-                "vehicle": None,
-                "lastUpdate": now_ts,
-            },
-        )
-        push_gate_update(stream_id, gate_state)
-        return gate_state
-
-    try:
-        sql = """
-            SELECT v.*, p.cleaned_input
-            FROM dbo."Vehicles" v
-            CROSS JOIN UNNEST($1::text[]) AS p(cleaned_input)
-            WHERE
-                LOWER(REPLACE(REPLACE(v."PlateNumber", ' ', ''), '-', '')) = p.cleaned_input
-                AND v."Active" = true
-            LIMIT 1
-        """
-        rows = await db_query(sql, [cleaned_plates])
-    except Exception as db_err:
-        print("[GateState] DB error:", db_err)
-        gate_state = set_gate_state_for_stream(
-            stream_id,
-            {
-                "stream_id": stream_id,
-                "vehicleFound": vehicle_count > 0,
-                "plate": None,
-                "driver": None,
-                "vehicle": None,
-                "lastUpdate": now_ts,
-            },
-        )
-        push_gate_update(stream_id, gate_state)
-        return gate_state
-
-    async def should_insert_log(plate_number: str) -> bool:
-        try:
-            last_ts_ms = await get_last_log_time_ms_for_plate(plate_number)
-            if last_ts_ms is not None and (now_ts - last_ts_ms) <= LOG_WINDOW_MS:
-                return False
-            return True
-        except Exception as e:
-            print("[Logs] 5-min check failed; allowing insert:", e)
-            return True
-
-    if not rows:
-        if best_plate_text:
-            try:
-                if await should_insert_log(best_plate_text):
-                    await insert_log_row(
-                        plate_number=best_plate_text,
-                        driver_json=None,
-                        vehicle_json=None,
-                        role_type="Visitors",
-                        verification="NOT REGISTERED",
-                        camera_source=stream_id,
-                        image_preview=image_preview,
-                        ai_confidence=ai_conf_bigint,
-                    )
-                    print(f"[Logs] NOT REGISTERED log inserted for {best_plate_text}")
-                else:
-                    print(f"[Logs] NOT REGISTERED log skipped (<5min) for {best_plate_text}")
-            except Exception as e:
-                print("[Logs] Failed to write NOT REGISTERED Logs row:", e)
-
-        gate_state = set_gate_state_for_stream(
-            stream_id,
-            {
-                "stream_id": stream_id,
-                "vehicleFound": vehicle_count > 0,
-                "plate": None,
-                "driver": None,
-                "vehicle": None,
-                "lastUpdate": now_ts,
-            },
-        )
-        push_gate_update(stream_id, gate_state)
-        return gate_state
-
-    vehicle_details = rows[0]
-
-    raw_driver = vehicle_details.get("Driver")
-    if isinstance(raw_driver, str):
-        try:
-            raw_driver = json.loads(raw_driver)
-        except Exception:
-            raw_driver = None
-
-    registered_plate = vehicle_details.get("PlateNumber") or best_plate_text or ""
-    vehicle_json = {
-        "brand": vehicle_details.get("Brand"),
-        "model": vehicle_details.get("Model"),
-        "type": vehicle_details.get("Type"),
-    }
-
-    try:
-        if registered_plate and await should_insert_log(registered_plate):
-            await insert_log_row(
-                plate_number=registered_plate,
-                driver_json=raw_driver,
-                vehicle_json=vehicle_json,
-                role_type=(raw_driver or {}).get("RoleType") if isinstance(raw_driver, dict) else None,
-                verification="REGISTERED",
-                camera_source=stream_id,
-                image_preview=image_preview,
-                ai_confidence=ai_conf_bigint,
-            )
-            print(f"[Logs] REGISTERED log inserted for {registered_plate}")
-        else:
-            print(f"[Logs] REGISTERED log skipped (<5min) for {registered_plate}")
-    except Exception as e:
-        print("[Logs] Failed to write REGISTERED Logs row:", e)
-
-    new_state = set_gate_state_for_stream(
-        stream_id,
-        {
-            "stream_id": stream_id,
-            "vehicleFound": True,
-            "plate": registered_plate,
-            "driver": raw_driver,
-            "vehicle": vehicle_json,
-            "lastUpdate": now_ts,
-        },
-    )
-
-    registered_gate_state_by_stream[stream_id] = dict(new_state)
-    registered_gate_ts_by_stream[stream_id] = now_ts
-
-    print(f"[GateState] stream={stream_id} registered match -> {json.dumps(new_state, default=str)}")
-    push_gate_update(stream_id, new_state)
-
-    return new_state
-
-
-# =========================================================
-# ROUTES
-# =========================================================
 @app.get("/health")
 async def health():
     safe_last_error = getattr(pusher_client, "last_error", None)
@@ -1436,21 +214,15 @@ async def health():
         "status": "ok",
         "device": DEVICE,
         "yolo_model": YOLO_MODEL_PATH,
-        "database_url": DATABASE_URL is not None,
-        "public_base_url": PUBLIC_BASE_URL or None,
+        "image_save_dir": IMAGE_SAVE_DIR,
         "serial_enabled": SERIAL_ENABLED,
         "serial_port": SERIAL_PORT if SERIAL_ENABLED else None,
         "stream_online_window_ms": STREAM_ONLINE_WINDOW_MS,
         "stream_stale_remove_ms": STREAM_STALE_REMOVE_MS,
-        "active_gate_states": list(gate_states_by_stream.keys()),
+        "active_gate_states": list(active_streams.keys()),
         "realtime": {
             "mode": pusher_mode,
             "reason": pusher_reason,
-            "use_local_requested": USE_LOCAL_PUSHER,
-            "use_local_effective": USE_LOCAL_PUSHER_EFFECTIVE,
-            "host": PUSHER_HOST or None,
-            "port": PUSHER_PORT,
-            "cluster": PUSHER_CLUSTER,
             "last_error": safe_last_error,
             "muted_until_epoch": safe_disabled_until if safe_disabled_until else None,
         },
@@ -1502,7 +274,7 @@ async def stream_frame(
     try:
         pusher_client.trigger("video-channel", "frame", {"stream_id": sid, "ts": ts})
     except Exception as e:
-        print("[/stream-frame] Pusher error:", e)
+        print("[MAIN] /stream-frame pusher error:", e)
 
     return JSONResponse({"success": True, "stream_id": sid, "ts": ts})
 
@@ -1521,6 +293,17 @@ async def get_latest_frame(stream_id: str = Query("mobile-1")):
     return Response(content=buffer, media_type=mimetype, headers=headers)
 
 
+@app.get("/images/{filename}")
+async def get_saved_image(filename: str):
+    safe_name = Path(filename).name
+    file_path = Path(IMAGE_SAVE_DIR) / safe_name
+
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return FileResponse(str(file_path))
+
+
 @app.post("/test-pusher")
 async def test_pusher():
     payload = {
@@ -1531,7 +314,6 @@ async def test_pusher():
         "vehicle": {"type": "Sedan", "brand": "Toyota", "model": "Vios"},
         "lastUpdate": int(time.time() * 1000),
     }
-    print("[/test-pusher] sending gate-update:", payload)
     pusher_client.trigger("gate-channel", "gate-update", payload)
     return {
         "success": True,
@@ -1541,70 +323,9 @@ async def test_pusher():
     }
 
 
-def run_yolo_vehicles(img_np: np.ndarray, stream_id: str) -> List[VehicleDetection]:
-    image_h, image_w = img_np.shape[:2]
-
-    try:
-        results = yolo_model.predict(
-            img_np,
-            conf=CONF_THRESHOLD,
-            iou=IOU_THRESHOLD,
-            device=DEVICE,
-            verbose=False,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"YOLO inference error: {e}")
-
-    if not results:
-        now = time.time()
-        last_dets = last_vehicle_detections_by_stream.get(stream_id, [])
-        last_ts = last_vehicle_ts_by_stream.get(stream_id, 0.0)
-        if last_dets and (now - last_ts) <= HOLD_SECONDS:
-            return last_dets
-        return []
-
-    result = results[0]
-    boxes = result.boxes
-
-    if boxes is None or len(boxes) == 0:
-        now = time.time()
-        last_dets = last_vehicle_detections_by_stream.get(stream_id, [])
-        last_ts = last_vehicle_ts_by_stream.get(stream_id, 0.0)
-        if last_dets and (now - last_ts) <= HOLD_SECONDS:
-            return last_dets
-        return []
-
-    detections: List[VehicleDetection] = []
-
-    for box in boxes:
-        cls_id = int(box.cls.item())
-        conf = float(box.conf.item())
-
-        if cls_id not in VEHICLE_CLASS_IDS:
-            continue
-
-        x1, y1, x2, y2 = box.xyxy[0].tolist()
-        bbox = build_vehicle_bbox(x1, y1, x2, y2, image_w, image_h)
-
-        detections.append(
-            VehicleDetection(
-                bbox=bbox,
-                confidence=conf,
-                class_id=cls_id,
-                class_name=VEHICLE_CLASS_NAMES.get(cls_id, f"class_{cls_id}"),
-            )
-        )
-
-    detections.sort(key=lambda d: d.confidence, reverse=True)
-
-    last_vehicle_detections_by_stream[stream_id] = detections
-    last_vehicle_ts_by_stream[stream_id] = time.time()
-
-    return detections
-
-
 @app.post("/detect")
 async def detect_all(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     detector_model: Optional[DetectorName] = Form(None),
     ocr_model: Optional[OcrName] = Form(None),
@@ -1620,54 +341,70 @@ async def detect_all(
     if not data:
         raise HTTPException(status_code=400, detail="Empty file.")
 
-    img_np = load_image_to_numpy(data)
-    h, w = img_np.shape[:2]
     sid = (stream_id or "").strip() or "mobile-1"
     ts = now_ms()
 
     touch_stream(sid, ts)
     cleanup_streams(ts)
 
+    img_np = load_image_to_numpy(data)
+    h, w = img_np.shape[:2]
+
     t0 = time.time()
 
+    # ---------------------------
+    # Critical path: AI first
+    # ---------------------------
     vehicles = run_yolo_vehicles(img_np, sid)
-    alpr_result = run_alpr(img_np, vehicles, detector_name, ocr_name)
+    alpr_result = run_alpr(img_np, detector_name, ocr_name)
     plates = alpr_result["plates"]
+    vehicles_payload = [v.model_dump() for v in vehicles]
 
-    print(f"[/detect] stream_id={sid}")
-    print(f"[/detect] vehicles_count={len(vehicles)}")
-    print(f"[/detect] plates_count={len(plates)}")
-    if vehicles:
-        print(f"[/detect] top_vehicle={vehicles[0].class_name} conf={vehicles[0].confidence:.4f}")
-    if plates:
-        print(f"[/detect] top_plate={plates[0]}")
-
-    gate = await update_gate_state_and_push(vehicles, plates, camera_source=sid)
-
-    print(f"[/detect] gate_state={json.dumps(gate, default=str)}")
+    # ---------------------------
+    # Critical path: fast gate state + serial early
+    # ---------------------------
+    gate = compute_gate_state_fast(
+        vehicles_payload,
+        plates,
+        camera_source=sid,
+    )
 
     light = await get_light_by_stream_id(sid)
-    print(f"[/detect] light_mapping={json.dumps(light, default=str) if light else None}")
-
     light_command = get_light_command_from_gate(gate)
     serial_command = build_light_serial_command(light, light_command)
 
-    print(f"[/detect] light_command={light_command}")
-    print(f"[/detect] serial_command={serial_command}")
-
     if serial_command:
         send_serial_command_to_pico(serial_command)
-    else:
-        print(f"[/detect] No active light mapping found for stream_id='{sid}', skipping serial send.")
+
+    # ---------------------------
+    # Background path:
+    # save preview + DB/log/pusher
+    # ---------------------------
+    background_tasks.add_task(
+        finalize_detect_side_effects,
+        sid,
+        data,
+        vehicles_payload,
+        plates,
+    )
 
     t1 = time.time()
+
+    print(f"[/detect] stream_id={sid}")
+    print(f"[/detect] vehicles_count={len(vehicles_payload)}")
+    print(f"[/detect] plates_count={len(plates)}")
+    if vehicles_payload:
+        print(f"[/detect] top_vehicle={vehicles_payload[0].get('class_name')} conf={vehicles_payload[0].get('confidence')}")
+    if plates:
+        print(f"[/detect] top_plate={json.dumps(plates[0], default=str)}")
+    print(f"[/detect] serial_command={serial_command}")
 
     return JSONResponse(
         {
             "success": True,
             "image_width": w,
             "image_height": h,
-            "vehicles": [v.model_dump() for v in vehicles],
+            "vehicles": vehicles_payload,
             "plates": plates,
             "alpr_model": alpr_result["model"],
             "yolo_model": YOLO_MODEL_PATH,
