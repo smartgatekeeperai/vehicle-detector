@@ -1,3 +1,5 @@
+# ai_plate.py
+
 import io
 import os
 import re
@@ -16,16 +18,24 @@ from fast_alpr import ALPR
 from fast_alpr.default_detector import PlateDetectorModel
 from fast_alpr.default_ocr import OcrModel
 
-FULL_IMAGE_MAX_SIDE = int(os.getenv("FULL_IMAGE_MAX_SIDE", "1280"))
+# -------------------------------------------------------------------
+# Faster defaults but still tuned for short-character plate support
+# -------------------------------------------------------------------
+FULL_IMAGE_MAX_SIDE = int(os.getenv("FULL_IMAGE_MAX_SIDE", "1024"))
 
-PLATE_REFINEMENT_PADDING_LEFT = float(os.getenv("PLATE_REFINEMENT_PADDING_LEFT", "0.06"))
-PLATE_REFINEMENT_PADDING_RIGHT = float(os.getenv("PLATE_REFINEMENT_PADDING_RIGHT", "0.10"))
+PLATE_REFINEMENT_PADDING_LEFT = float(os.getenv("PLATE_REFINEMENT_PADDING_LEFT", "0.05"))
+PLATE_REFINEMENT_PADDING_RIGHT = float(os.getenv("PLATE_REFINEMENT_PADDING_RIGHT", "0.08"))
 PLATE_REFINEMENT_PADDING_TOP = float(os.getenv("PLATE_REFINEMENT_PADDING_TOP", "0.08"))
 PLATE_REFINEMENT_PADDING_BOTTOM = float(os.getenv("PLATE_REFINEMENT_PADDING_BOTTOM", "0.08"))
 
-MIN_PLATE_TEXT_LEN = int(os.getenv("MIN_PLATE_TEXT_LEN", "6"))
+# Allow shorter detected plate text
+MIN_PLATE_TEXT_LEN = int(os.getenv("MIN_PLATE_TEXT_LEN", "4"))
 MAX_PLATE_TEXT_LEN = int(os.getenv("MAX_PLATE_TEXT_LEN", "12"))
 PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "en")
+
+# Confidence thresholds for early exit
+FAST_ACCEPT_CONF = float(os.getenv("FAST_ACCEPT_CONF", "0.72"))
+SECOND_ACCEPT_CONF = float(os.getenv("SECOND_ACCEPT_CONF", "0.66"))
 
 DETECTOR_MODELS: List[PlateDetectorModel] = list(get_args(PlateDetectorModel))
 OCR_MODELS: List[str] = list(get_args(OcrModel))
@@ -66,7 +76,7 @@ def load_image_to_numpy(data: bytes) -> np.ndarray:
         img = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image file: {e}")
-    return np.array(img)
+    return np.ascontiguousarray(np.array(img))
 
 
 def resize_if_needed(img: Image.Image, max_side: int) -> Image.Image:
@@ -115,10 +125,8 @@ def normalize_final_plate_text(text: str) -> str:
     cleaned = clean_plate_text(text)
     if not cleaned:
         return ""
-
     if len(cleaned) > MAX_PLATE_TEXT_LEN:
         cleaned = cleaned[:MAX_PLATE_TEXT_LEN]
-
     return cleaned
 
 
@@ -134,7 +142,6 @@ def longest_digit_run(text: str) -> str:
     runs.sort(key=len, reverse=True)
     best = runs[0]
 
-    # conservative cleanup for one extra leading noise digit
     if len(best) == 11 and len(best) >= 2 and best[1] == "0":
         best = best[1:]
 
@@ -145,10 +152,6 @@ def longest_digit_run(text: str) -> str:
 
 
 def trim_numeric_plate_noise(candidate: str) -> str:
-    """
-    For temporary plates, remove short trailing alpha noise like:
-    0701904052RE -> 0701904052
-    """
     if not candidate:
         return ""
 
@@ -159,41 +162,29 @@ def trim_numeric_plate_noise(candidate: str) -> str:
     digit_count = count_digits(cleaned)
     letter_count = count_letters(cleaned)
 
-    # if plate is mostly numeric and ends in short alpha noise, trim it
-    m = re.match(r"^(\d{8,12})([A-Z]{1,2})$", cleaned)
-    if m and digit_count >= 8 and letter_count <= 2:
+    m = re.match(r"^(\d{7,12})([A-Z]{1,2})$", cleaned)
+    if m and digit_count >= 7 and letter_count <= 2:
         return m.group(1)
 
     return cleaned
 
 
 def extract_best_plate_candidate(text: str) -> str:
-    """
-    Supports both:
-    - AHA8208
-    - ABC1234
-    - 04011131760
-    - 0701904052
-
-    Strongly prefers long numeric-only candidate when present,
-    to avoid trailing letters from REGISTERED/REGION.
-    """
     cleaned = clean_plate_text(text)
     if not cleaned:
         return ""
 
-    # 1) Strong preference for long numeric temporary plate
+    # Strong preference for long numeric temporary plate
     best_digits = longest_digit_run(cleaned)
-    if 8 <= len(best_digits) <= 12:
+    if 7 <= len(best_digits) <= 12:
         return best_digits
 
     candidates: List[str] = []
 
-    # 2) Common alphanumeric plate patterns
     patterns = [
-        r"[A-Z]{2,4}\d{2,4}",   # AHA8208, ABC1234
-        r"[A-Z]{1,3}\d{3,4}",   # A1234, AB1234
-        r"\d{6,12}",            # numeric temporary plates
+        r"[A-Z]{2,4}\d{2,4}",
+        r"[A-Z]{1,3}\d{2,4}",
+        r"\d{4,12}",
     ]
 
     for pat in patterns:
@@ -203,42 +194,30 @@ def extract_best_plate_candidate(text: str) -> str:
             if MIN_PLATE_TEXT_LEN <= len(m2) <= MAX_PLATE_TEXT_LEN:
                 candidates.append(m2)
 
-    # 3) Broader fallback but guarded
-    broad_matches = re.findall(r"[A-Z0-9]{6,12}", cleaned)
+    broad_matches = re.findall(r"[A-Z0-9]{4,12}", cleaned)
     for m in broad_matches:
         m2 = trim_numeric_plate_noise(m)
-
-        # reject numeric-dominant candidate with too many trailing letters
-        if count_digits(m2) >= 8 and count_letters(m2) > 1:
+        if count_digits(m2) >= 7 and count_letters(m2) > 1:
             continue
-
         if MIN_PLATE_TEXT_LEN <= len(m2) <= MAX_PLATE_TEXT_LEN:
             candidates.append(m2)
 
     if candidates:
-        # Prefer more plausible candidates
         def rank_key(v: str):
             d = count_digits(v)
             a = count_letters(v)
 
-            # numeric temporary plates
-            if a == 0 and 8 <= d <= 12:
+            if a == 0 and 7 <= d <= 12:
+                return (6, len(v), d)
+            if a >= 1 and d >= 2:
                 return (5, len(v), d)
-
-            # standard alphanumeric plates
-            if a >= 2 and d >= 2:
+            if a == 0 and 4 <= d <= 6:
                 return (4, len(v), d)
-
-            # shorter numeric-only fallback
-            if a == 0 and 6 <= d <= 7:
-                return (3, len(v), d)
-
             return (1, len(v), d)
 
         candidates = sorted(set(candidates), key=rank_key, reverse=True)
         return candidates[0]
 
-    # 4) final fallback to longest digit run
     if best_digits:
         return best_digits
 
@@ -250,14 +229,15 @@ def length_bonus(total_len: int) -> float:
         return -1.2
     if MIN_PLATE_TEXT_LEN <= total_len <= MAX_PLATE_TEXT_LEN:
         return 1.2
-    if total_len == 5:
-        return -0.4
-    if total_len == 13:
-        return -0.3
     return -1.0
 
 
-def score_plate_candidate(text: str, conf: float, bbox: Optional[dict] = None, image_size: Optional[Tuple[int, int]] = None) -> float:
+def score_plate_candidate(
+    text: str,
+    conf: float,
+    bbox: Optional[dict] = None,
+    image_size: Optional[Tuple[int, int]] = None,
+) -> float:
     cleaned = normalize_final_plate_text(text)
     if not cleaned:
         return -9999.0
@@ -271,20 +251,14 @@ def score_plate_candidate(text: str, conf: float, bbox: Optional[dict] = None, i
     score += digit_count * 0.10
     score += letter_count * 0.12
 
-    # short alphanumeric plate bonus
-    if digit_count >= 2 and letter_count >= 2:
-        score += 0.55
+    if digit_count >= 2 and letter_count >= 1:
+        score += 0.45
 
-    # long numeric temporary plate bonus
-    if letter_count == 0 and 8 <= digit_count <= 12:
-        score += 0.75
+    if letter_count == 0 and 7 <= digit_count <= 12:
+        score += 0.70
 
-    # penalize numeric plate polluted by letters
-    if digit_count >= 8 and letter_count >= 1:
-        score -= 0.45 * letter_count
-
-    if total_len < MIN_PLATE_TEXT_LEN:
-        score -= 1.5
+    if digit_count >= 7 and letter_count >= 1:
+        score -= 0.35 * letter_count
 
     if bbox is not None:
         bw = max(1, int(bbox["x2"]) - int(bbox["x1"]))
@@ -292,7 +266,7 @@ def score_plate_candidate(text: str, conf: float, bbox: Optional[dict] = None, i
         aspect = bw / float(bh)
         area = bw * bh
         score += min(aspect, 8.0) * 0.04
-        score += min(area / 5000.0, 1.0) * 0.20
+        score += min(area / 5000.0, 1.0) * 0.18
 
         if image_size is not None:
             iw, ih = image_size
@@ -300,7 +274,7 @@ def score_plate_candidate(text: str, conf: float, bbox: Optional[dict] = None, i
             cy = (bbox["y1"] + bbox["y2"]) / 2.0
             dx = abs(cx - (iw / 2.0)) / max(iw, 1)
             dy = abs(cy - (ih / 2.0)) / max(ih, 1)
-            score -= (dx + dy) * 0.35
+            score -= (dx + dy) * 0.30
 
     return score
 
@@ -349,17 +323,14 @@ def crop_number_band(plate_img: Image.Image, mode: str = "tight") -> Image.Image
     w, h = plate_img.size
 
     if mode == "tight":
-        top = 0.20
-        bottom = 0.68
+        top = 0.18
+        bottom = 0.72
     elif mode == "mid":
-        top = 0.16
-        bottom = 0.74
-    elif mode == "low":
-        top = 0.24
-        bottom = 0.82
+        top = 0.15
+        bottom = 0.78
     else:
-        top = 0.20
-        bottom = 0.68
+        top = 0.18
+        bottom = 0.72
 
     x1 = int(round(w * 0.02))
     x2 = int(round(w * 0.98))
@@ -420,10 +391,10 @@ def run_plate_detector_on_pil(pil_img: Image.Image, detector_name: str, ocr_name
 
     temp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             temp_path = tmp.name
 
-        pil_img.save(temp_path, format="PNG", optimize=False)
+        pil_img.save(temp_path, format="JPEG", quality=92, optimize=False)
         results = alpr.predict(temp_path)
     except Exception as e:
         print("[AI_PLATE] Full traceback:")
@@ -441,7 +412,7 @@ def run_plate_detector_on_pil(pil_img: Image.Image, detector_name: str, ocr_name
 
 def recognize_with_paddle_boxes(img: Image.Image) -> List[dict]:
     ocr = get_paddle_ocr()
-    img_np = np.array(img.convert("RGB"))
+    img_np = np.ascontiguousarray(np.array(img.convert("RGB")))
     try:
         result = ocr.ocr(img_np, cls=False)
     except Exception as e:
@@ -492,9 +463,6 @@ def recognize_with_paddle(img: Image.Image) -> Tuple[str, float]:
     conf = float(sum(p["confidence"] for p in pieces) / len(pieces))
     plate_text = extract_best_plate_candidate(joined)
 
-    print(f"[AI_PLATE RAW] joined={joined}")
-    print(f"[AI_PLATE CLEAN] plate={plate_text}")
-
     return plate_text, conf
 
 
@@ -517,6 +485,7 @@ def _merge_bbox(items: List[dict]) -> dict:
 
 
 def fallback_full_image_ocr(base_full: Image.Image) -> List[dict]:
+    # only run as last resort
     pieces = recognize_with_paddle_boxes(base_full)
     if not pieces:
         return []
@@ -567,7 +536,7 @@ def fallback_full_image_ocr(base_full: Image.Image) -> List[dict]:
         merged_text = filtered[i]["text"]
         merged_conf_vals = [filtered[i]["confidence"]]
 
-        for j in range(i + 1, min(i + 4, n)):
+        for j in range(i + 1, min(i + 3, n)):
             if not _same_row(filtered[j - 1], filtered[j]):
                 break
 
@@ -613,11 +582,6 @@ def fallback_full_image_ocr(base_full: Image.Image) -> List[dict]:
     if len(best["ocr"]["text"]) < MIN_PLATE_TEXT_LEN:
         return []
 
-    print(
-        f"[AI_PLATE OCR-FALLBACK BEST] text={best['ocr']['text']} "
-        f"conf={best['ocr']['confidence']:.4f} score={best['_score']:.4f}"
-    )
-
     return [
         {
             "ocr": best["ocr"],
@@ -641,7 +605,7 @@ def _vehicle_front_plate_roi(vehicle_bbox: dict, img_w: int, img_h: int) -> Opti
     x1 = vx1 + int(vw * 0.28)
     x2 = vx1 + int(vw * 0.72)
     y1 = vy1 + int(vh * 0.50)
-    y2 = vy1 + int(vh * 0.80)
+    y2 = vy1 + int(vh * 0.82)
 
     return clamp_box(x1, y1, x2, y2, img_w, img_h)
 
@@ -701,57 +665,6 @@ def _vehicle_crop_ocr_fallback(base_full: Image.Image, vehicles: List[dict]) -> 
             }
         )
 
-    pieces.sort(key=lambda p: (p["bbox"]["y1"], p["bbox"]["x1"]))
-    n = len(pieces)
-    for i in range(n):
-        group = [pieces[i]]
-        merged_text = pieces[i]["text"]
-        conf_vals = [pieces[i]["confidence"]]
-
-        for j in range(i + 1, min(i + 4, n)):
-            if not _same_row(pieces[j - 1], pieces[j]):
-                break
-
-            gap = pieces[j]["bbox"]["x1"] - pieces[j - 1]["bbox"]["x2"]
-            prev_h = max(1, pieces[j - 1]["bbox"]["y2"] - pieces[j - 1]["bbox"]["y1"])
-            if gap > prev_h * 2.0:
-                break
-
-            group.append(pieces[j])
-            merged_text += pieces[j]["text"]
-            conf_vals.append(pieces[j]["confidence"])
-
-            plate_text = extract_best_plate_candidate(merged_text)
-            if not plate_text:
-                continue
-
-            merged_local = _merge_bbox(group)
-            merged_global = {
-                "x1": rx1 + merged_local["x1"],
-                "y1": ry1 + merged_local["y1"],
-                "x2": rx1 + merged_local["x2"],
-                "y2": ry1 + merged_local["y2"],
-            }
-
-            merged_conf = float(sum(conf_vals) / len(conf_vals))
-            score = score_plate_candidate(
-                plate_text,
-                merged_conf,
-                bbox=merged_global,
-                image_size=(img_w, img_h),
-            )
-
-            candidates.append(
-                {
-                    "ocr": {
-                        "text": plate_text,
-                        "confidence": merged_conf,
-                    },
-                    "bbox": merged_global,
-                    "_score": score,
-                }
-            )
-
     if not candidates:
         return []
 
@@ -760,11 +673,6 @@ def _vehicle_crop_ocr_fallback(base_full: Image.Image, vehicles: List[dict]) -> 
 
     if len(best["ocr"]["text"]) < MIN_PLATE_TEXT_LEN:
         return []
-
-    print(
-        f"[AI_PLATE VEHICLE-ROI BEST] text={best['ocr']['text']} "
-        f"conf={best['ocr']['confidence']:.4f} score={best['_score']:.4f}"
-    )
 
     return [
         {
@@ -776,11 +684,11 @@ def _vehicle_crop_ocr_fallback(base_full: Image.Image, vehicles: List[dict]) -> 
 
 def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str, vehicles: Optional[List[dict]] = None) -> dict:
     """
-    Fast robust flow:
-    1. detector once on original image
-    2. if found -> plate crop OCR
+    Faster robust flow:
+    1. detector once on resized image
+    2. if found -> OCR on plate crop only (2 band modes max)
     3. if detector fails and vehicle exists -> vehicle ROI OCR fallback
-    4. if still fail -> one smart full-image OCR fallback
+    4. only last resort -> full-image OCR fallback
     """
     base_full = Image.fromarray(img_np).convert("RGB")
     base_full = resize_if_needed(base_full, FULL_IMAGE_MAX_SIDE)
@@ -831,7 +739,8 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str, vehicles: Op
     x1, y1, x2, y2 = expand_local_plate_bbox(bbox, img_w, img_h)
     plate_crop = base_full.crop((x1, y1, x2, y2))
 
-    modes = ["tight", "mid", "low"]
+    # only 2 modes for speed
+    modes = ["tight", "mid"]
     candidates = []
 
     for idx, mode in enumerate(modes):
@@ -847,11 +756,6 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str, vehicles: Op
             image_size=(img_w, img_h),
         )
 
-        print(
-            f"[AI_PLATE BAND] mode={mode} raw={raw_text} plate={plate_text} "
-            f"conf={conf:.4f} score={score:.4f}"
-        )
-
         if plate_text:
             candidates.append(
                 {
@@ -863,7 +767,7 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str, vehicles: Op
 
         total_len = len(plate_text)
 
-        if idx == 0 and MIN_PLATE_TEXT_LEN <= total_len <= MAX_PLATE_TEXT_LEN and conf >= 0.78:
+        if idx == 0 and MIN_PLATE_TEXT_LEN <= total_len <= MAX_PLATE_TEXT_LEN and conf >= FAST_ACCEPT_CONF:
             return {
                 "model": {
                     "detector_model": detector_name,
@@ -880,7 +784,7 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str, vehicles: Op
                 ],
             }
 
-        if idx == 1 and MIN_PLATE_TEXT_LEN <= total_len <= MAX_PLATE_TEXT_LEN and conf >= 0.72:
+        if idx == 1 and MIN_PLATE_TEXT_LEN <= total_len <= MAX_PLATE_TEXT_LEN and conf >= SECOND_ACCEPT_CONF:
             break
 
     if not candidates:

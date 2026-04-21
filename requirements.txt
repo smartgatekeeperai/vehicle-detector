@@ -16,9 +16,9 @@ fast-alpr==0.4.0
 onnxruntime==1.18.0
 
 asyncpg==0.29.0
-pusher==3.3.2
 python-dotenv==1.0.1
 pyserial==3.5
+websockets==13.1
 
 paddleocr==2.7.3
 paddlepaddle==2.6.2

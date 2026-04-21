@@ -208,3 +208,4 @@ __marimo__/
 yolov8x.pt
 yolov8n.pt
 storage/logs/*
+images

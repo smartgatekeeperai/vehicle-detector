@@ -4,13 +4,91 @@
 |-- ai_vehicle.py
 |-- dbo.sql
 |-- howtorunlocal.txt
+|-- images
+    |-- cam-ddxrfa_1776781196013_74a616e0.jpg
+    |-- cam-ddxrfa_1776781199905_5cd38b62.jpg
+    |-- cam-ddxrfa_1776781204586_9e45648f.jpg
+    |-- cam-ddxrfa_1776781210222_fd8843ad.jpg
+    |-- cam-ddxrfa_1776781215926_0e91b8fe.jpg
+    |-- cam-ddxrfa_1776781220799_71c0d456.jpg
+    |-- cam-ddxrfa_1776781225349_30c71da4.jpg
+    |-- cam-ddxrfa_1776781231231_52809aea.jpg
+    |-- cam-ddxrfa_1776781235833_b2821eb1.jpg
+    |-- cam-ddxrfa_1776781242519_01030a29.jpg
+    |-- cam-ddxrfa_1776781251171_19a980a1.jpg
+    |-- cam-ddxrfa_1776781260629_3fd1b1af.jpg
+    |-- cam-ddxrfa_1776781268770_58c41fd2.jpg
+    |-- cam-ddxrfa_1776781274143_ae964fbd.jpg
+    |-- cam-ddxrfa_1776781278375_8772d899.jpg
+    |-- cam-ddxrfa_1776781284533_f0567f8a.jpg
+    |-- cam-ddxrfa_1776781287523_cdaf241f.jpg
+    |-- cam-ddxrfa_1776781290081_d9acb368.jpg
+    |-- cam-ddxrfa_1776781294301_dcdc1aad.jpg
+    |-- cam-ddxrfa_1776781299462_7c8f91d6.jpg
+    |-- cam-ddxrfa_1776781304267_a1fbc0fd.jpg
+    |-- cam-ddxrfa_1776781310837_c2d42de8.jpg
+    |-- cam-ddxrfa_1776781315431_b77ed787.jpg
+    |-- cam-ddxrfa_1776781320419_4d854790.jpg
+    |-- cam-ddxrfa_1776781330866_ad133575.jpg
+    |-- cam-ddxrfa_1776781336445_fce75e34.jpg
+    |-- cam-ddxrfa_1776781341991_81f17c7c.jpg
+    |-- cam-ddxrfa_1776781347287_8b8ecb76.jpg
+    |-- cam-ddxrfa_1776782665144_bf0108dc.jpg
+    |-- cam-ddxrfa_1776782679734_5b1da823.jpg
+    |-- cam-ddxrfa_1776782696549_c2078ef7.jpg
+    |-- cam-ddxrfa_1776782712638_3d46a18f.jpg
+    |-- cam-ddxrfa_1776782723899_3b96b71a.jpg
+    |-- cam-ddxrfa_1776782746397_a49c1600.jpg
+    |-- cam-ddxrfa_1776782762919_1b7aa8c7.jpg
+    |-- cam-ddxrfa_1776782777667_1d92ab5d.jpg
+    |-- cam-ddxrfa_1776782789949_eb924627.jpg
+    |-- cam-ddxrfa_1776790541836_a1862f6a.jpg
+    |-- cam-ddxrfa_1776790551207_1eb73568.jpg
+    |-- cam-ddxrfa_1776790560138_fc6b2954.jpg
+    |-- cam-ddxrfa_1776790567222_c3186cb5.jpg
+    |-- cam-ddxrfa_1776790574466_a9fcd296.jpg
+    |-- cam-ddxrfa_1776790578834_ff45cd1a.jpg
+    |-- cam-ddxrfa_1776790582772_7377ff76.jpg
+    |-- cam-ddxrfa_1776790586570_9122fec6.jpg
+    |-- cam-ddxrfa_1776790590802_89d52eea.jpg
+    |-- cam-ddxrfa_1776790594766_7b30e091.jpg
+    |-- cam-ddxrfa_1776790598701_1101c1e9.jpg
+    |-- cam-ddxrfa_1776790602847_b978ee59.jpg
+    |-- cam-ddxrfa_1776790606858_df5c3142.jpg
+    |-- cam-ddxrfa_1776790610727_6443368f.jpg
+    |-- cam-ddxrfa_1776790614960_40e32d81.jpg
+    |-- mobile-1_1776782830958_96757214.jpg
+    |-- mobile-1_1776786025051_193dfdd7.jpg
+    |-- mobile-1_1776786122989_19672f2f.jpg
+    |-- mobile-1_1776786143120_363a13d3.jpg
+    |-- mobile-1_1776787017534_fcfd45ee.jpg
+    |-- mobile-1_1776787033872_0782da05.jpg
+    |-- mobile-1_1776787056733_03c8aa83.jpg
+    |-- mobile-1_1776787075390_ea7ee794.jpg
+    |-- mobile-1_1776787418587_1d908521.jpg
+    |-- mobile-1_1776787463088_41c9e181.jpg
+    |-- mobile-1_1776787478372_e8578375.jpg
+    |-- mobile-1_1776787511326_6f83f55c.jpg
+    |-- mobile-1_1776787531574_7ffb3cd8.jpg
+    |-- mobile-1_1776787570442_f14032f3.jpg
+    |-- mobile-1_1776788155507_ddaf42f9.jpg
+    |-- mobile-1_1776788187929_4fe5a5a1.jpg
+    |-- mobile-1_1776788222711_2c17afab.jpg
+    |-- mobile-1_1776789002314_db498f8b.jpg
+    |-- mobile-1_1776789021175_995d0fdb.jpg
+    |-- mobile-1_1776789458489_73471cc0.jpg
+    |-- mobile-1_1776789499872_963063f5.jpg
+    |-- mobile-1_1776790402376_082123ce.jpg
+    |-- mobile-1_1776790427874_6008793b.jpg
+    |-- mobile-1_1776790454773_3d410d7b.jpg
 |-- LICENSE
 |-- main.py
+|-- oldenv
 |-- README.md
 |-- requirements.txt
 |-- services.py
 |-- start.py
-|-- storage
+|-- ws_client.py
 |-- yolov8n.pt
 |-- yolov8x.pt
 |-- __pycache__
@@ -18,3 +96,4 @@
     |-- ai_vehicle.cpython-310.pyc
     |-- main.cpython-310.pyc
     |-- services.cpython-310.pyc
+    |-- ws_client.cpython-310.pyc

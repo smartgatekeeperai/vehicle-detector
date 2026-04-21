@@ -23,7 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image, ImageDraw, ImageFont
 
 from ai_plate import DETECTOR_MODELS, OCR_MODELS, DetectorName, OcrName, load_image_to_numpy, run_alpr
-from ai_vehicle import DEVICE, YOLO_MODEL_PATH, run_yolo_vehicles
+from ai_vehicle import DEVICE, YOLO_MODEL_PATH, force_vehicle_from_plates, run_yolo_vehicles
 from services import (
     IMAGE_SAVE_DIR,
     SERIAL_ENABLED,
@@ -41,18 +41,16 @@ from services import (
     init_db,
     latest_frames,
     now_ms,
-    pusher_client,
-    pusher_mode,
-    pusher_reason,
     save_image_bytes,
     send_serial_command_to_pico,
     touch_stream,
     update_gate_state_and_push,
 )
+from ws_client import publish_event, start_realtime_ws, stop_realtime_ws, ws_status
 
 app = FastAPI(
     title="Smart Gate Keeper - YOLOv8 + FastALPR + Fast PaddleOCR",
-    version="2.3.0",
+    version="2.4.0",
 )
 
 app.add_middleware(
@@ -171,7 +169,7 @@ async def finalize_detect_side_effects(
     Non-critical path:
     - build/save preview image
     - DB/log state update
-    - pusher update through services
+    - websocket update through services
     """
     image_preview_filename = None
 
@@ -200,18 +198,27 @@ async def finalize_detect_side_effects(
 @app.on_event("startup")
 async def startup():
     await init_db()
+    await start_realtime_ws()
+
+    try:
+        import numpy as np
+
+        dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+        _ = run_yolo_vehicles(dummy, "__warmup__")
+        _ = run_alpr(dummy, DETECTOR_MODELS[0], OCR_MODELS[0], vehicles=[])
+        print("[INIT] AI warmup complete")
+    except Exception as e:
+        print(f"[INIT] AI warmup failed: {e}")
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await stop_realtime_ws()
     await close_db()
 
 
 @app.get("/health")
 async def health():
-    safe_last_error = getattr(pusher_client, "last_error", None)
-    safe_disabled_until = getattr(pusher_client, "disabled_until", 0.0)
-
     return {
         "status": "ok",
         "device": DEVICE,
@@ -222,12 +229,7 @@ async def health():
         "stream_online_window_ms": STREAM_ONLINE_WINDOW_MS,
         "stream_stale_remove_ms": STREAM_STALE_REMOVE_MS,
         "active_gate_states": list(active_streams.keys()),
-        "realtime": {
-            "mode": pusher_mode,
-            "reason": pusher_reason,
-            "last_error": safe_last_error,
-            "muted_until_epoch": safe_disabled_until if safe_disabled_until else None,
-        },
+        "realtime": ws_status(),
     }
 
 
@@ -274,9 +276,9 @@ async def stream_frame(
     cleanup_streams(ts)
 
     try:
-        pusher_client.trigger("video-channel", "frame", {"stream_id": sid, "ts": ts})
+        await publish_event("video-frame", {"stream_id": sid, "ts": ts})
     except Exception as e:
-        print("[MAIN] /stream-frame pusher error:", e)
+        print("[MAIN] /stream-frame websocket publish error:", e)
 
     return JSONResponse({"success": True, "stream_id": sid, "ts": ts})
 
@@ -306,8 +308,8 @@ async def get_saved_image(filename: str):
     return FileResponse(str(file_path))
 
 
-@app.post("/test-pusher")
-async def test_pusher():
+@app.post("/test-ws")
+async def test_ws():
     payload = {
         "stream_id": "test-stream",
         "vehicleFound": True,
@@ -316,11 +318,10 @@ async def test_pusher():
         "vehicle": {"type": "Sedan", "brand": "Toyota", "model": "Vios"},
         "lastUpdate": int(time.time() * 1000),
     }
-    pusher_client.trigger("gate-channel", "gate-update", payload)
+    await publish_event("gate-update", payload)
     return {
         "success": True,
-        "mode": pusher_mode,
-        "reason": pusher_reason,
+        "realtime": ws_status(),
         "payload": payload,
     }
 
@@ -349,22 +350,31 @@ async def detect_all(
     touch_stream(sid, ts)
     cleanup_streams(ts)
 
-    img_np = load_image_to_numpy(data)
-    h, w = img_np.shape[:2]
-
     t0 = time.time()
 
-    # ---------------------------
-    # Critical path: AI first
-    # ---------------------------
+    t_load_0 = time.time()
+    img_np = load_image_to_numpy(data)
+    h, w = img_np.shape[:2]
+    t_load_1 = time.time()
+
+    t_vehicle_0 = time.time()
     vehicles = run_yolo_vehicles(img_np, sid)
     vehicles_payload = [v.model_dump() for v in vehicles]
+    t_vehicle_1 = time.time()
+
+    t_plate_0 = time.time()
     alpr_result = run_alpr(img_np, detector_name, ocr_name, vehicles=vehicles_payload)
     plates = alpr_result["plates"]
+    t_plate_1 = time.time()
 
-    # ---------------------------
-    # Critical path: fast gate state + serial early
-    # ---------------------------
+    t_forced_vehicle_0 = time.time()
+    if not vehicles_payload and plates:
+        forced_vehicles = force_vehicle_from_plates(img_np, plates, sid)
+        if forced_vehicles:
+            vehicles_payload = [v.model_dump() for v in forced_vehicles]
+    t_forced_vehicle_1 = time.time()
+
+    t_gate_0 = time.time()
     gate = compute_gate_state_fast(
         vehicles_payload,
         plates,
@@ -377,11 +387,8 @@ async def detect_all(
 
     if serial_command:
         send_serial_command_to_pico(serial_command)
+    t_gate_1 = time.time()
 
-    # ---------------------------
-    # Background path:
-    # save preview + DB/log/pusher
-    # ---------------------------
     background_tasks.add_task(
         finalize_detect_side_effects,
         sid,
@@ -400,6 +407,13 @@ async def detect_all(
     if plates:
         print(f"[/detect] top_plate={json.dumps(plates[0], default=str)}")
     print(f"[/detect] serial_command={serial_command}")
+
+    print(f"[/detect timing] load_ms={(t_load_1 - t_load_0)*1000:.1f}")
+    print(f"[/detect timing] vehicle_ms={(t_vehicle_1 - t_vehicle_0)*1000:.1f}")
+    print(f"[/detect timing] plate_ms={(t_plate_1 - t_plate_0)*1000:.1f}")
+    print(f"[/detect timing] forced_vehicle_ms={(t_forced_vehicle_1 - t_forced_vehicle_0)*1000:.1f}")
+    print(f"[/detect timing] gate_ms={(t_gate_1 - t_gate_0)*1000:.1f}")
+    print(f"[/detect timing] total_ms={(t1 - t0)*1000:.1f}")
 
     return JSONResponse(
         {
