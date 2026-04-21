@@ -1,3 +1,5 @@
+# main.py
+
 import io
 import json
 import os
@@ -356,9 +358,9 @@ async def detect_all(
     # Critical path: AI first
     # ---------------------------
     vehicles = run_yolo_vehicles(img_np, sid)
-    alpr_result = run_alpr(img_np, detector_name, ocr_name)
-    plates = alpr_result["plates"]
     vehicles_payload = [v.model_dump() for v in vehicles]
+    alpr_result = run_alpr(img_np, detector_name, ocr_name, vehicles=vehicles_payload)
+    plates = alpr_result["plates"]
 
     # ---------------------------
     # Critical path: fast gate state + serial early
