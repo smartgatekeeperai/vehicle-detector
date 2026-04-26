@@ -28,12 +28,10 @@ PLATE_REFINEMENT_PADDING_RIGHT = float(os.getenv("PLATE_REFINEMENT_PADDING_RIGHT
 PLATE_REFINEMENT_PADDING_TOP = float(os.getenv("PLATE_REFINEMENT_PADDING_TOP", "0.08"))
 PLATE_REFINEMENT_PADDING_BOTTOM = float(os.getenv("PLATE_REFINEMENT_PADDING_BOTTOM", "0.08"))
 
-# Allow shorter detected plate text
 MIN_PLATE_TEXT_LEN = int(os.getenv("MIN_PLATE_TEXT_LEN", "4"))
 MAX_PLATE_TEXT_LEN = int(os.getenv("MAX_PLATE_TEXT_LEN", "12"))
 PADDLEOCR_LANG = os.getenv("PADDLEOCR_LANG", "en")
 
-# Confidence thresholds for early exit
 FAST_ACCEPT_CONF = float(os.getenv("FAST_ACCEPT_CONF", "0.72"))
 SECOND_ACCEPT_CONF = float(os.getenv("SECOND_ACCEPT_CONF", "0.66"))
 
@@ -49,6 +47,50 @@ elif "cct-s-v2-global-model" in OCR_MODELS:
 
 DetectorName = Literal[tuple(DETECTOR_MODELS)]  # type: ignore
 OcrName = Literal[tuple(OCR_MODELS)]  # type: ignore
+
+# -------------------------------------------------------------------
+# OCR noise words commonly merged with Philippine temporary plates
+# -------------------------------------------------------------------
+NOISE_TOKENS = sorted(
+    {
+        "REGISTERED",
+        "REGISTER",
+        "REGIST",
+        "TEMPORARYPLATE",
+        "TEMPORARY",
+        "PLATE",
+        "REGION",
+        "MOTORCYCLECITY",
+        "MOTORCYCLE",
+        "CITY",
+        "HONDA",
+        "YAMAHA",
+        "KAWASAKI",
+        "SUZUKI",
+        "NMAX",
+        "CLICK",
+        "MIO",
+        "TMX",
+        "WAVE",
+    },
+    key=len,
+    reverse=True,
+)
+
+# Fragments that often appear when OCR only catches part of the printed word
+NOISE_EDGE_FRAGMENTS = sorted(
+    {
+        "REGIST",
+        "REGIS",
+        "REGI",
+        "REG",
+        "REGION",
+        "TEMPORARY",
+        "PLATE",
+    },
+    key=len,
+    reverse=True,
+)
 
 
 @lru_cache(maxsize=8)
@@ -151,6 +193,67 @@ def longest_digit_run(text: str) -> str:
     return best
 
 
+def _remove_known_noise_tokens(text: str) -> str:
+    cleaned = clean_plate_text(text)
+    if not cleaned:
+        return ""
+
+    out = cleaned
+    for token in NOISE_TOKENS:
+        out = out.replace(token, "")
+    return out
+
+
+def _trim_edge_noise_fragments(text: str) -> str:
+    """
+    Removes partial OCR leftovers on the left/right side only,
+    without destroying the middle of the actual plate.
+    """
+    value = clean_plate_text(text)
+    if not value:
+        return ""
+
+    changed = True
+    while changed and value:
+        changed = False
+
+        for frag in NOISE_EDGE_FRAGMENTS:
+            if value.startswith(frag) and len(value) > len(frag):
+                value = value[len(frag):]
+                changed = True
+                break
+
+        if changed:
+            continue
+
+        for frag in NOISE_EDGE_FRAGMENTS:
+            if value.endswith(frag) and len(value) > len(frag):
+                value = value[: -len(frag)]
+                changed = True
+                break
+
+    return value
+
+
+def sanitize_ocr_text_for_plate(text: str) -> str:
+    """
+    Main sanitizer for OCR text before candidate extraction.
+
+    Handles cases like:
+    - REGION7929GOR      -> 7929GOR
+    - 123ABCREGIST       -> 123ABC
+    - REGISTERED123ABC   -> 123ABC
+    """
+    cleaned = clean_plate_text(text)
+    if not cleaned:
+        return ""
+
+    cleaned = _remove_known_noise_tokens(cleaned)
+    cleaned = _trim_edge_noise_fragments(cleaned)
+    cleaned = clean_plate_text(cleaned)
+    return cleaned
+
+
 def trim_numeric_plate_noise(candidate: str) -> str:
     if not candidate:
         return ""
@@ -169,22 +272,16 @@ def trim_numeric_plate_noise(candidate: str) -> str:
     return cleaned
 
 
-def extract_best_plate_candidate(text: str) -> str:
-    cleaned = clean_plate_text(text)
-    if not cleaned:
-        return ""
-
-    # Strong preference for long numeric temporary plate
-    best_digits = longest_digit_run(cleaned)
-    if 7 <= len(best_digits) <= 12:
-        return best_digits
-
+def _extract_candidates_from_text(cleaned: str) -> List[str]:
     candidates: List[str] = []
 
     patterns = [
         r"[A-Z]{2,4}\d{2,4}",
         r"[A-Z]{1,3}\d{2,4}",
         r"\d{4,12}",
+        r"\d{3,6}[A-Z]{1,4}",
+        r"[A-Z]{1,4}\d{3,6}",
+        r"[A-Z0-9]{4,12}",
     ]
 
     for pat in patterns:
@@ -194,26 +291,45 @@ def extract_best_plate_candidate(text: str) -> str:
             if MIN_PLATE_TEXT_LEN <= len(m2) <= MAX_PLATE_TEXT_LEN:
                 candidates.append(m2)
 
-    broad_matches = re.findall(r"[A-Z0-9]{4,12}", cleaned)
-    for m in broad_matches:
-        m2 = trim_numeric_plate_noise(m)
-        if count_digits(m2) >= 7 and count_letters(m2) > 1:
-            continue
-        if MIN_PLATE_TEXT_LEN <= len(m2) <= MAX_PLATE_TEXT_LEN:
-            candidates.append(m2)
+    return candidates
+
+
+def extract_best_plate_candidate(text: str) -> str:
+    raw_cleaned = clean_plate_text(text)
+    if not raw_cleaned:
+        return ""
+
+    sanitized = sanitize_ocr_text_for_plate(raw_cleaned)
+
+    # Strong preference for long numeric temporary plate
+    best_digits = longest_digit_run(sanitized)
+    if 7 <= len(best_digits) <= 12:
+        return best_digits
+
+    candidates = _extract_candidates_from_text(sanitized)
+
+    # If sanitizer removed too much, fall back to raw cleaned OCR
+    if not candidates:
+        best_digits_raw = longest_digit_run(raw_cleaned)
+        if 7 <= len(best_digits_raw) <= 12:
+            return best_digits_raw
+        candidates = _extract_candidates_from_text(raw_cleaned)
 
     if candidates:
         def rank_key(v: str):
             d = count_digits(v)
             a = count_letters(v)
 
+            # prefer realistic mixed temp plate / short mixed plate
+            if a >= 1 and d >= 2 and 4 <= len(v) <= 8:
+                return (7, len(v), d, -a)
             if a == 0 and 7 <= d <= 12:
-                return (6, len(v), d)
+                return (6, len(v), d, 0)
             if a >= 1 and d >= 2:
-                return (5, len(v), d)
+                return (5, len(v), d, -a)
             if a == 0 and 4 <= d <= 6:
-                return (4, len(v), d)
-            return (1, len(v), d)
+                return (4, len(v), d, 0)
+            return (1, len(v), d, -a)
 
         candidates = sorted(set(candidates), key=rank_key, reverse=True)
         return candidates[0]
@@ -259,6 +375,12 @@ def score_plate_candidate(
 
     if digit_count >= 7 and letter_count >= 1:
         score -= 0.35 * letter_count
+
+    # Penalize obvious noise words surviving in candidate
+    upper_text = clean_plate_text(text)
+    for token in NOISE_TOKENS:
+        if token in upper_text:
+            score -= 1.25
 
     if bbox is not None:
         bw = max(1, int(bbox["x2"]) - int(bbox["x1"]))
@@ -485,7 +607,6 @@ def _merge_bbox(items: List[dict]) -> dict:
 
 
 def fallback_full_image_ocr(base_full: Image.Image) -> List[dict]:
-    # only run as last resort
     pieces = recognize_with_paddle_boxes(base_full)
     if not pieces:
         return []
@@ -739,7 +860,6 @@ def run_alpr(img_np: np.ndarray, detector_name: str, ocr_name: str, vehicles: Op
     x1, y1, x2, y2 = expand_local_plate_bbox(bbox, img_w, img_h)
     plate_crop = base_full.crop((x1, y1, x2, y2))
 
-    # only 2 modes for speed
     modes = ["tight", "mid"]
     candidates = []
 
